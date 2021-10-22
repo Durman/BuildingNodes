@@ -141,7 +141,7 @@ class BuildingGenerator(NodeTree):
                         pass  # Already was linked
 
         # let panels know their indexes
-        obj_index = {obj: i for i, obj in enumerate(self.inst_col.objects)}
+        obj_index = {obj: i for i, obj in enumerate(sorted(self.inst_col.objects, key=lambda o: o.name))}
         for node in self.nodes:
             if node.bl_idname == PanelNode.bl_idname and node.inputs[0].value:
                 node.panel_index = obj_index[node.inputs[0].value]
