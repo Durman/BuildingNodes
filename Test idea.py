@@ -497,9 +497,9 @@ class StackPanelsNode(BaseNode, Node):
         self.outputs.new(PanelSocket.bl_idname, "")
 
 
-class FlorePatternNode(BaseNode, Node):
-    bl_idname = 'FlorePatternNode'
-    bl_label = "Flore Pattern"
+class FloorPatternNode(BaseNode, Node):
+    bl_idname = 'FloorPatternNode'
+    bl_label = "Floor Pattern"
     category = Categories.FLOOR
     Inputs = namedtuple('Inputs', ['height', 'left', 'fill', 'distribute', 'right'])
 
@@ -515,10 +515,10 @@ class FlorePatternNode(BaseNode, Node):
 
     @classmethod
     def execute(cls, inputs: Inputs, params):
-        def flore_gen(build: Building, precompute=False):
+        def floor_gen(build: Building, precompute=False):
             if precompute:
-                build.cur_flore.height = inputs.height(build)
-                build.cur_flore.repeatable = False
+                build.cur_floor.height = inputs.height(build)
+                build.cur_floor.repeatable = False
                 return
 
             panels = []
@@ -566,14 +566,14 @@ class FlorePatternNode(BaseNode, Node):
                 vec[build.scale_lay] = (pan.height_scale * xy_scale, pan.height_scale, 1)
                 vec[build.ind_lay] = pan.index
                 verts.append(vec)
-            build.cur_flore.verts = verts
-            build.cur_flore.height = inputs.height(build)
-        return flore_gen
+            build.cur_floor.verts = verts
+            build.cur_floor.height = inputs.height(build)
+        return floor_gen
 
 
-class FloreAttributesNode(BaseNode, Node):
-    bl_idname = 'FloreAttributesNode'
-    bl_label = "Flore Attributes"
+class FloorAttributesNode(BaseNode, Node):
+    bl_idname = 'FloorAttributesNode'
+    bl_label = "Floor Attributes"
     category = Categories.FLOOR
 
     def node_init(self):
@@ -582,24 +582,52 @@ class FloreAttributesNode(BaseNode, Node):
         self.outputs.new(IntSocket.bl_idname, "Number").display_shape = 'DIAMOND'
         self.outputs.new(FloatSocket.bl_idname, "Left corner angle").display_shape = 'DIAMOND'
         self.outputs.new(FloatSocket.bl_idname, "Right corner angle").display_shape = 'DIAMOND'
+        self.outputs.new(FloatSocket.bl_idname, "Azimuth").display_shape = 'DIAMOND'
 
     @staticmethod
     def execute(inputs, props):
-        def flore_width(build: Building):
+        def floor_width(build: Building):
             return build.cur_facade.width
 
-        def flore_height(build: Building):
+        def floor_height(build: Building):
             return None
 
-        def flore_index(build: Building):
-            return build.cur_flore.index
+        def floor_index(build: Building):
+            return build.cur_floor.index
 
         def left_corner_angle(build: Building):
             return build.cur_facade.left_wall_angle
 
         def right_corner_angle(build: Building):
             return build.cur_facade.right_wall_angle
-        return flore_width, flore_height, flore_index, left_corner_angle, right_corner_angle
+
+        def azimuth(build: Building):
+            return build.cur_facade.azimuth
+        return floor_width, floor_height, floor_index, left_corner_angle, right_corner_angle, azimuth
+
+
+class FloorSwitchNode(BaseNode, Node):
+    bl_idname = 'FloorSwitchNode'
+    bl_label = "Floor Switch"
+    category = Categories.FLOOR
+    Inputs = namedtuple('Inputs', ['bool', 'true_floor', 'false_floor'])
+
+    def node_init(self):
+        self.inputs.new(BoolSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
+        self.inputs.new(FloorSocket.bl_idname, "True floor")
+        self.inputs.new(FloorSocket.bl_idname, "False floor")
+        self.outputs.new(FloorSocket.bl_idname, "")
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def switch_floor(build, precompute=False):
+            if inputs.bool(build):
+                if inputs.true_floor is not None:
+                    inputs.true_floor(build, precompute=precompute)
+            else:
+                if inputs.false_floor is not None:
+                    inputs.false_floor(build, precompute=precompute)
+        return switch_floor
 
 
 class StackFloorsNode(BaseNode, Node):
@@ -607,17 +635,17 @@ class StackFloorsNode(BaseNode, Node):
     bl_label = "Stack Floors"
     category = Categories.FACADE
     repeat_first_socket = True
-    Inputs = namedtuple('Inputs', ['flore0', 'flore1', 'flore2', 'flore3'])
+    Inputs = namedtuple('Inputs', ['floor0', 'floor1', 'floor2', 'floor3'])
 
     def node_init(self):
-        self.inputs.new(FloorSocket.bl_idname, "First flore")
+        self.inputs.new(FloorSocket.bl_idname, "First floor")
         self.outputs.new(FacadeSocket.bl_idname, "")
 
     @staticmethod
     def execute(inputs: Inputs, params):
-        def stack_flores(build: Building):
+        def stack_floors(build: Building):
             pass
-        return stack_flores
+        return stack_floors
 
 
 class FacadePatternNode(BaseNode, Node):
@@ -637,57 +665,57 @@ class FacadePatternNode(BaseNode, Node):
     def execute(inputs: Inputs, params):
         def facade_generator(build: Building):
             facade = build.cur_facade
-            flores_height = 0
-            flore_fs = []
-            cur_flore_ind = 0
+            floors_height = 0
+            floor_fs = []
+            cur_floor_ind = 0
             if inputs.first:
-                floor: Flore = Flore(index=cur_flore_ind)
-                cur_flore_ind += 1
-                build.cur_flore = floor
+                floor: Floor = Floor(index=cur_floor_ind)
+                cur_floor_ind += 1
+                build.cur_floor = floor
                 inputs.first(build, precompute=True)
-                flores_height += floor.height
-                flore_fs.append(inputs.first)
+                floors_height += floor.height
+                floor_fs.append(inputs.first)
             if inputs.fill:
-                for i in range(cur_flore_ind, 10000):
+                for i in range(cur_floor_ind, 10000):
                     if inputs.last:
-                        flore: Flore = Flore(index=cur_flore_ind)
-                        build.cur_flore = flore
+                        floor: Floor = Floor(index=cur_floor_ind)
+                        build.cur_floor = floor
                         inputs.last(build, precompute=True)
-                        if build.cur_facade.height < (flores_height + flore.height):
-                            flores_height += flore.height
-                            flore_fs.append(inputs.last)
-                            cur_flore_ind += 1
+                        if build.cur_facade.height < (floors_height + floor.height):
+                            floors_height += floor.height
+                            floor_fs.append(inputs.last)
+                            cur_floor_ind += 1
                             break
                         else:
-                            pass  # last flore can't be added yet
+                            pass  # last floor can't be added yet
                     else:
-                        if build.cur_facade.height < flores_height:
+                        if build.cur_facade.height < floors_height:
                             break
-                    flore: Flore = Flore(index=cur_flore_ind)
-                    cur_flore_ind += 1
-                    build.cur_flore = flore
+                    floor: Floor = Floor(index=cur_floor_ind)
+                    cur_floor_ind += 1
+                    build.cur_floor = floor
                     inputs.fill(build, precompute=True)
-                    flores_height += flore.height
-                    flore_fs.append(inputs.fill)
+                    floors_height += floor.height
+                    floor_fs.append(inputs.fill)
 
-            z_scale = facade.height / flores_height
-            flores_height = 0
-            for fi, flore_f in enumerate(flore_fs):
-                flore: Flore = Flore(index=fi)
-                build.cur_flore = flore
-                flore_f(build)
-                height = flore.height * z_scale
-                for v in flore.verts:
-                    v.co += Vector((0, 0, flores_height + height / 2))
+            z_scale = facade.height / floors_height
+            floors_height = 0
+            for fi, floor_f in enumerate(floor_fs):
+                floor: Floor = Floor(index=fi)
+                build.cur_floor = floor
+                floor_f(build)
+                height = floor.height * z_scale
+                for v in floor.verts:
+                    v.co += Vector((0, 0, floors_height + height / 2))
                     v[build.scale_lay] *= Vector((1, z_scale, 1))
-                flores_height += height
+                floors_height += height
         return facade_generator
 
     @staticmethod
     def _execute(inputs: Inputs, params):
         def facade_generator(build: Building):
             facade = build.cur_facade
-            facade.cur_flore_ind = 0
+            facade.cur_floor_ind = 0
             vertices, flor_height = inputs.fill(build)
             flor_num = max(int(round(facade.height / flor_height)), 1)
             z_scale = facade.height / (flor_num * flor_height)
@@ -696,7 +724,7 @@ class FacadePatternNode(BaseNode, Node):
                 v.co += z_step * 0.5
                 v[build.scale_lay] *= Vector((1, z_scale, 1))
             for fi in range(1, flor_num):
-                facade.cur_flore_ind = fi
+                facade.cur_floor_ind = fi
                 vertices, flor_height = inputs.fill(build)
                 for v in vertices:
                     v.co += z_step * 0.5 + z_step * fi
@@ -729,16 +757,27 @@ class SetFacadeAttributeNode(BaseNode, Node):
 class MathNode(BaseNode, Node):
     bl_idname = 'MathNode'
     bl_label = "Math"
-    Inputs = namedtuple('Inputs', ['val1', 'val2'])
+    Inputs = namedtuple('Inputs', ['val1', 'val2', 'tolerance'])
     Props = namedtuple('Props', ['mode'])
 
+    def update_mode(self, context):
+        self.inputs['Tolerance'].enabled = self.mode == 'is_close'
+        self.id_data.update()
+
     mode: bpy.props.EnumProperty(
-        items=[(i.lower(), i, '') for i in ['Add', 'Multiply', 'Grater_than', 'Less_than', 'Remainder']])
+        items=[(i.lower(), i, '') for i in [
+            'Add', 'Multiply', 'Grater_than', 'Less_than', 'Remainder', 'Is_close', 'And', 'Or']],
+        update=update_mode,
+    )
 
     def node_init(self):
         self.inputs.new(FloatSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
         self.inputs.new(FloatSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
+        s = self.inputs.new(FloatSocket.bl_idname, "Tolerance")
+        s.display_shape = 'DIAMOND_DOT'
+        s.value = 0.01
         self.outputs.new(FloatSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
+        self.update_mode(None)
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "mode", text='')
@@ -746,15 +785,18 @@ class MathNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, props: Props):
         funcs = {
-            'add': lambda v1, v2: v1 + v2,
-            'multiply': lambda v1, v2: v1 * v2,
-            'grater_than': lambda v1, v2: v1 > v2,
-            'less_than': lambda v1, v2: v1 < v2,
-            'remainder': lambda v1, v2: v1 % v2,
+            'add': lambda v1, v2, _: v1 + v2,
+            'multiply': lambda v1, v2, _: v1 * v2,
+            'grater_than': lambda v1, v2, _: v1 > v2,
+            'less_than': lambda v1, v2, _: v1 < v2,
+            'remainder': lambda v1, v2, _: v1 % v2,
+            'is_close': lambda v1, v2, v3: isclose(v1, v2, abs_tol=v3),
+            'and': lambda v1, v2, _: bool(v1) and bool(v2),
+            'or': lambda v1, v2, _: bool(v1) or bool(v2),
         }
 
         def math(build):
-            return funcs[props.mode](inputs.val1(build), inputs.val2(build))
+            return funcs[props.mode](inputs.val1(build), inputs.val2(build), inputs.tolerance(build))
         return math
 
 
@@ -768,6 +810,8 @@ class ObjectPanel(Panel):
     def draw(self, context):
         col = self.layout.column()
         obj = context.object
+        if obj is None:
+            return
         if obj.building_props.error:
             col.label(text=obj.building_props.error, icon='ERROR')
         if obj:
@@ -951,7 +995,7 @@ class Facade:
 
         # self.vertices: bmesh.types.BMVertSeq = vertices
         # self.index = index
-        self.cur_flore_ind = None
+        self.cur_floor_ind = None
         self.cur_panel_ind = None
         self.height = z_len
         self.width = xy_len
@@ -960,6 +1004,7 @@ class Facade:
         self.normal = face.normal
         self.left_wall_angle = left_edge.calc_face_angle()
         self.right_wall_angle = right_edge.calc_face_angle()
+        self.azimuth = Building.calc_azimuth(self.normal)
 
 
 class Building:
@@ -971,7 +1016,7 @@ class Building:
         self.bm: bmesh.types.BMesh = bm
         self.base_bm = base_bm
         self.cur_facade: Facade = None
-        self.cur_flore: Flore = None
+        self.cur_floor: Floor = None
 
     def facades(self) -> Iterable[Facade]:
         wall_lay = self.base_bm.faces.layers.int.get("Is wall")
@@ -979,14 +1024,23 @@ class Building:
             wall_lay = self.base_bm.faces.layers.int.new("Is wall")
 
         for fi, face in enumerate(self.base_bm.faces):
-            if isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1):
+            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
+            is_valid = not isclose(face.calc_area(), 0, abs_tol=0.1)
+            if is_vertical and is_valid:
                 face[wall_lay] = 1
                 yield Facade(face, fi)
             else:
                 face[wall_lay] = 0
 
+    @staticmethod
+    def calc_azimuth(vec: Vector):
+        vec = vec.normalized()
+        north = Vector((0, 1, 0))
+        is_right = vec.cross(north).normalized().z < 0
+        return vec @ north + 3 if is_right else 1 - vec @ north
 
-class Flore:
+
+class Floor:
     def __init__(self, index=None):
         self.verts: list[bmesh.types.BMVert] = None
         self.index = index
