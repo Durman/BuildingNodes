@@ -815,7 +815,15 @@ class ObjectPanel(Panel):
         if obj.building_props.error:
             col.label(text=obj.building_props.error, icon='ERROR')
         if obj:
-            col.prop(obj.building_props, 'facade_style')
+            props: ObjectProperties = obj.building_props
+            row = col.row(align=True)
+            row.active = props.facade_style is not None
+            row.label(text="Facade style:")
+            row.prop(props, 'show_in_edit_mode', text='', icon='EDITMODE_HLT')
+            row.prop(props, 'realtime', text='', icon='RESTRICT_VIEW_OFF' if props.realtime else 'RESTRICT_VIEW_ON')
+            row.prop(props, 'show_in_render', text='',
+                     icon='RESTRICT_RENDER_OFF' if props.show_in_render else 'RESTRICT_RENDER_ON')
+            col.template_ID(props, 'facade_style', new='bn.add_new_facade_style')
         else:
             col.label(text='Select object')
 
@@ -938,10 +946,33 @@ class ObjectProperties(PropertyGroup):
             else:
                 self.error = ''
 
+    def update_show_in_edit(self, context):
+        mod = self.get_modifier()
+        if mod is not None:
+            mod.show_in_editmode = self.show_in_edit_mode
+
+    def update_realtime(self, context):
+        mod = self.get_modifier()
+        if mod is not None:
+            mod.show_viewport = self.realtime
+            if self.realtime:
+                self.facade_style.apply(self.id_data)
+
+    def update_show_in_render(self, context):
+        mod = self.get_modifier()
+        if mod is not None:
+            mod.show_render = self.show_in_render
+
     facade_style: bpy.props.PointerProperty(
         type=bpy.types.NodeTree, poll=is_building_tree, name="Facade Style", update=update_style)
     points: bpy.props.PointerProperty(type=bpy.types.Object)
     error: bpy.props.StringProperty()
+    show_in_edit_mode: bpy.props.BoolProperty(
+        default=True, description="Show facade style in edit mode", update=update_show_in_edit)
+    realtime: bpy.props.BoolProperty(
+        default=True, description='Display facade style in viewport', update=update_realtime)
+    show_in_render: bpy.props.BoolProperty(
+        default=True, description='Use facade style during render', update=update_show_in_render)
 
     def get_modifier(self) -> Optional[bpy.types.Modifier]:
         obj = self.id_data
@@ -958,6 +989,22 @@ class ObjectProperties(PropertyGroup):
             modifier = obj.modifiers.new("Facade style", 'NODES')
 
         return GeometryTreeInterface(obj, modifier.node_group)
+
+
+class AddNewFacadeStyleOperator(Operator):
+    bl_idname = "bn.add_new_facade_style"
+    bl_label = "Add new facade style"
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None
+
+    def execute(self, context):
+        obj = context.object
+        obj_props: ObjectProperties = obj.building_props
+        obj_props.facade_style = bpy.data.node_groups.new("FacadeStyle", BuildingGenerator.bl_idname)
+        return {'FINISHED'}
+
 
 
 classes = []
@@ -1065,7 +1112,7 @@ def update_tree_timer():
         update_trees = []
         for obj in bpy.data.objects:
             obj_props: ObjectProperties = obj.building_props
-            if obj_props.facade_style and obj_props.facade_style.was_changed:
+            if obj_props.facade_style and obj_props.facade_style.was_changed and obj_props.realtime:
                 try:
                     obj_props.facade_style.apply(obj)
                 except Exception as e:
@@ -1083,12 +1130,22 @@ def update_tree_timer():
 
 @persistent
 def update_active_object(scene):
-    if bpy.context.object is None or bpy.context.object.mode != 'EDIT':
+    obj = bpy.context.object
+    if obj is None:
         return
-    obj_props: ObjectProperties = bpy.context.object.building_props
-    if obj_props.facade_style is None:
+    obj_props: ObjectProperties = obj.building_props
+    can_be_updated = obj_props.facade_style is not None and obj_props.realtime
+    if not can_be_updated:
         return
-    obj_props.facade_style.apply(bpy.context.object)
+
+    if obj.mode == 'EDIT':
+        obj['was_in_edit'] = True
+        if obj_props.show_in_edit_mode:
+            obj_props.facade_style.apply(obj)
+    else:
+        if 'was_in_edit' in obj:
+            del obj['was_in_edit']
+            obj_props.facade_style.apply(obj)
 
 
 def register():
