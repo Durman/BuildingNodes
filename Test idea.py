@@ -18,6 +18,11 @@ from mathutils import Vector
 from nodeitems_utils import NodeCategory, NodeItem
 
 
+class FacadeTreeNames(PropertyGroup):
+    identifier: bpy.props.StringProperty()
+    user_name: bpy.props.StringProperty()
+
+
 class BuildingGenerator(NodeTree):
     bl_idname = 'BuildingGenerator'
     bl_label = "Building Generator"
@@ -26,7 +31,7 @@ class BuildingGenerator(NodeTree):
 
     inst_col: bpy.props.PointerProperty(type=bpy.types.Collection, description="Keep all panels to be instanced")
     was_changed: bpy.props.BoolProperty(description="If True the tree should be reevaluated")
-    facade_names: bpy.props.CollectionProperty(type=PropertyGroup)
+    facade_names: bpy.props.CollectionProperty(type=FacadeTreeNames)
 
     def update(self):
         BuildingGenerator.was_changes = True
@@ -44,7 +49,8 @@ class BuildingGenerator(NodeTree):
         else:
             bm = bmesh.new()
             bm.from_mesh(obj.data)
-        points_bm = self.get_points(bm)
+        obj_fac_names = [names.obj_facade_name for names in obj_props.facade_names_mapping]
+        points_bm = self.get_points(bm, obj_fac_names)
         points_bm.to_mesh(obj_props.points.data)
         points_bm.free()
         if obj.mode != 'EDIT':
@@ -55,7 +61,7 @@ class BuildingGenerator(NodeTree):
         # set instances
         gn_tree.set_instances(self.inst_col)
 
-    def get_points(self, base_bm):
+    def get_points(self, base_bm, obj_facade_names):
         self.store_instances()
         sock_data = dict()
         for node, prev_socks in self.walk():
@@ -70,7 +76,7 @@ class BuildingGenerator(NodeTree):
                 else:
                     in_data.append(None)
             if node.bl_idname == FacadeInstanceNode.bl_idname:
-                return node.execute(node.gen_input_mapping()(*in_data), base_bm)
+                return node.execute(node.gen_input_mapping()(*in_data), base_bm, obj_facade_names)
             else:
                 if hasattr(node, 'Props'):
                     props = node.Props(*[getattr(node, n) for n in node.Props._fields])
@@ -160,34 +166,13 @@ class BuildingGenerator(NodeTree):
 
     def update_facade_names(self):
         # todo make interface of all output nodes equal
-
-        # face maps should be reordered along with named facades
-        # if not is_rename_event:
-        #     initial_mapping: defaultdict[dict[Optional[bpy.types.FaceMap]]] = defaultdict(dict)
-        #     for obj in bpy.data.objects:
-        #         props: ObjectProperties = obj.building_props
-        #         if props.facade_style:
-        #             for facade_name, f_map in props.facade_names_mapping():
-        #                 initial_mapping[obj][facade_name] = f_map
-
-        # recreate facade names
         for node in self.nodes:
             if node.bl_idname == FacadeInstanceNode.bl_idname:
                 self.facade_names.clear()
                 for socket in node.inputs[1:]:
-                    self.facade_names.add().name = socket.user_name or socket.default_name
-
-        # reorder face maps
-        # if not is_rename_event:
-        #     for obj, mapping in initial_mapping.items():
-        #         for fn_i, facade_name in enumerate(self.facade_names):
-        #
-        #             # new facade name was added
-        #             if facade_name.name not in mapping:
-        #                 used_maps = {m for m in mapping.values()}
-        #                 unused_map = next(m for m in chain(obj.face_maps, None) if m in used_maps or m is None)
-        #                 if unused_map is None:
-        #                     unused_map = obj.face_maps.new(name='Facade')
+                    sock_names: FacadeTreeNames = self.facade_names.add()
+                    sock_names.identifier = socket.identifier
+                    sock_names.user_name = socket.user_name or socket.default_name
 
 
 class BaseSocket:
@@ -371,17 +356,32 @@ class FacadeInstanceNode(BaseNode, Node):
 
     def node_init(self):
         self.inputs.new(FacadeSocket.bl_idname, "Fill")
-        self.inputs.new(FacadeSocket.bl_idname, "Named")
 
     def draw_buttons(self, context, layout):
         layout.prop(self, 'edit_sockets', toggle=1)
 
     @staticmethod
-    def execute(inputs: Inputs, base_bm: bmesh.types.BMesh):
-        build = Building(base_bm)
-        for facade in build.facades():
-            build.cur_facade = facade
-            inputs.fill(build)
+    def execute(inputs: Inputs, base_bm: bmesh.types.BMesh, obj_facade_names: list[str]):
+        build = Building()
+        input_ind = {'': 0}
+        for i, obj_f_name in enumerate(obj_facade_names, start=1):
+            if obj_f_name != '':
+                input_ind[obj_f_name] = i
+
+        f_lay = base_bm.faces.layers.string.get('Facade name') or base_bm.faces.layers.string.new('Facade name')
+        wall_lay = base_bm.faces.layers.int.get("Is wall") or base_bm.faces.layers.int.new("Is wall")
+
+        for fi, face in enumerate(base_bm.faces):
+            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
+            is_valid = not isclose(face.calc_area(), 0, abs_tol=0.1)
+            facade_name = face[f_lay].decode()
+            facade_func = inputs[ind] if (ind := input_ind.get(facade_name, 0)) < len(inputs) else inputs[0]
+            if is_vertical and is_valid and facade_func:
+                face[wall_lay] = 1
+                build.cur_facade = Facade(face, fi)
+                facade_func(build)
+            else:
+                face[wall_lay] = 0
         return build.bm
 
 
@@ -874,23 +874,27 @@ class ObjectPanel(Panel):
                      icon='RESTRICT_RENDER_OFF' if props.show_in_render else 'RESTRICT_RENDER_ON')
             col.template_ID(props, 'facade_style', new='bn.add_new_facade_style')
 
-            col.label(text='Named facades:')
-            col.use_property_split = True
-            col.use_property_decorate = False
-            for i, (facade_name, face_map) in enumerate(props.facade_names_mapping()):
-                row = col.row(align=True)
-                if face_map is not None:
-                    row.prop(face_map, 'name', text=facade_name)
+            col.prop(props, 'show_facade_names',
+                     icon='DOWNARROW_HLT' if props.show_facade_names else 'RIGHTARROW', emboss=False)
+            if props.show_facade_names and props.facade_style:
+                col.use_property_split = True
+                col.use_property_decorate = False
+                for f_map in props.facade_names_mapping:
+                    row = col.row(align=True)
+                    row.prop(f_map, 'obj_facade_name', text=f_map.tree_facade_name)
                     if obj.mode == 'EDIT':
-                        add_op = row.operator(EditFaceMapsOperator.bl_idname, text='', icon='ADD')
+                        add_op = row.operator(EditFacadeAttributesOperator.bl_idname, text='', icon='ADD')
                         add_op.operation = 'add'
-                        add_op.face_map_index = i
-                        remove_op = row.operator(EditFaceMapsOperator.bl_idname, text='', icon='REMOVE')
+                        add_op.facade_name = f_map.obj_facade_name
+                        remove_op = row.operator(EditFacadeAttributesOperator.bl_idname, text='', icon='REMOVE')
                         remove_op.operation = 'remove'
-                        remove_op.face_map_index = i
-                else:
-                    row = col.row(heading=facade_name)
-                    row.prop(props, 'add_face_map', toggle=1)
+                        remove_op.facade_name = f_map.obj_facade_name
+                if obj.mode == 'EDIT':
+                    row = col.row(align=True)
+                    add_op = row.operator(EditFacadeAttributesOperator.bl_idname, text='Add to fill facade', icon='ADD')
+                    add_op.operation = 'add'
+                    add_op.facade_name = ''
+
         else:
             col.label(text='Select object')
 
@@ -994,6 +998,20 @@ class GeometryTreeInterface:
         obj.modifiers['Facade style']["Input_5_attribute_name"] = "Wall index"
 
 
+class FacadeNamesMapping(PropertyGroup):
+    def update_obj_facade_name(self, context):
+        # rename event
+        prev_name_key = 'prev_name'
+        if prev_name_key in self and self[prev_name_key] != '':
+            bpy.ops.bn.edit_facade_attributes(
+                operation='rename', facade_name=self[prev_name_key], new_facade_name=self.obj_facade_name)
+        self[prev_name_key] = self.obj_facade_name
+
+    tree_facade_identifier: bpy.props.StringProperty(description="Socket identifier")
+    tree_facade_name: bpy.props.StringProperty()
+    obj_facade_name: bpy.props.StringProperty(update=update_obj_facade_name)
+
+
 class ObjectProperties(PropertyGroup):
     def is_building_tree(self, tree):
         return tree.bl_idname == BuildingGenerator.bl_idname
@@ -1005,6 +1023,7 @@ class ObjectProperties(PropertyGroup):
                 self.id_data.modifiers.remove(mod)
             self.error = ''
         else:
+            self.update_mapping()
             try:
                 self.facade_style.apply(self.id_data)
             except Exception as e:
@@ -1030,14 +1049,6 @@ class ObjectProperties(PropertyGroup):
         if mod is not None:
             mod.show_render = self.show_in_render
 
-    def update_add_face_map(self, context):
-        if self.add_face_map:
-            obj = self.id_data
-            for facade_name, face_map in self.facade_names_mapping():
-                if face_map is None:
-                    obj.face_maps.new(name=facade_name)
-            self.add_face_map = False
-
     facade_style: bpy.props.PointerProperty(
         type=bpy.types.NodeTree, poll=is_building_tree, name="Facade Style", update=update_style)
     points: bpy.props.PointerProperty(type=bpy.types.Object)
@@ -1048,7 +1059,8 @@ class ObjectProperties(PropertyGroup):
         default=True, description='Display facade style in viewport', update=update_realtime)
     show_in_render: bpy.props.BoolProperty(
         default=True, description='Use facade style during render', update=update_show_in_render)
-    add_face_map: bpy.props.BoolProperty(name='Add', update=update_add_face_map)
+    show_facade_names: bpy.props.BoolProperty(name='Named facades', default=True)
+    facade_names_mapping: bpy.props.CollectionProperty(type=FacadeNamesMapping)
 
     def get_modifier(self) -> Optional[bpy.types.Modifier]:
         obj = self.id_data
@@ -1065,6 +1077,23 @@ class ObjectProperties(PropertyGroup):
             modifier = obj.modifiers.new("Facade style", 'NODES')
 
         return GeometryTreeInterface(obj, modifier.node_group)
+
+    def update_mapping(self):
+        mapping = {m.tree_facade_identifier: m.obj_facade_name for m in self.facade_names_mapping}
+        if self.facade_style:
+            self.facade_names_mapping.clear()
+            facade: FacadeTreeNames
+            for facade in self.facade_style.facade_names:
+                f_map: FacadeNamesMapping = self.facade_names_mapping.add()
+
+                # new facade name
+                if facade.identifier not in mapping:
+                    f_map.tree_facade_identifier = facade.identifier
+                    f_map.tree_facade_name = facade.user_name
+                else:
+                    f_map.tree_facade_identifier = facade.identifier
+                    f_map.tree_facade_name = facade.user_name
+                    f_map.obj_facade_name = mapping[facade.identifier]
 
     def facade_names_mapping(self) -> Iterable[tuple[str, Optional[bpy.types.FaceMap]]]:
         yield from zip((n.name for n in self.facade_style.facade_names), chain(self.id_data.face_maps, cycle([None])))
@@ -1097,10 +1126,11 @@ class EditSocketsOperator(Operator):
     tree_name: bpy.props.StringProperty()
     node_name: bpy.props.StringProperty()
     socket_identifier: bpy.props.StringProperty()
+    old_socket_name: bpy.props.StringProperty()
     new_socket_name: bpy.props.StringProperty(name='New name')
 
     @classmethod
-    def description(self, context, properties):
+    def description(cls, context, properties):
         descriptions = {
             'move_up': "Move the socket upper",
             'move_down': "Move the socket downer",
@@ -1134,12 +1164,17 @@ class EditSocketsOperator(Operator):
         else:
             raise TypeError(f"It is not known how to handle the operation={self.operation}")
         tree.update_facade_names()
+        for obj in bpy.data.objects:
+            props: ObjectProperties = obj.building_props
+            if props.facade_style and props.facade_style.bl_idname == BuildingGenerator.bl_idname:
+                props.update_mapping()
         return {'FINISHED'}
 
     def invoke(self, context, event):
         self.tree_name = context.node.id_data.name
         self.node_name = context.node.name
         self.socket_identifier = context.socket.identifier
+        self.old_socket_name = context.socket.user_name
         self.new_socket_name = context.socket.name
         wm = context.window_manager
         if self.operation == 'rename':
@@ -1151,21 +1186,62 @@ class EditSocketsOperator(Operator):
         self.layout.prop(self, 'new_socket_name')
 
 
-class EditFaceMapsOperator(Operator):
-    bl_idname = "bn.edit_face_maps"
-    bl_label = "Edit face maps"
+class EditFacadeAttributesOperator(Operator):
+    bl_idname = "bn.edit_facade_attributes"
+    bl_label = "Edit facade attributes"
     bl_options = {'INTERNAL', }
 
-    operation: bpy.props.EnumProperty(items=[(i, i, '') for i in ['add', 'remove']])
-    face_map_index: bpy.props.IntProperty()
+    operation: bpy.props.EnumProperty(items=[(i, i, '') for i in ['add', 'remove', 'rename']])
+    facade_name: bpy.props.StringProperty()
+    new_facade_name: bpy.props.StringProperty(description='New facade name to rename')
+
+    @classmethod
+    def description(cls, context, properties):
+        descriptions = {
+            'rename': "Replace values with facade_name to new_facade_name",
+            'add': f'Assign selected faces to "{properties.facade_name}" facade',
+            'remove': f'Remove selected faces from "{properties.facade_name}" facade',
+        }
+        return descriptions[properties.operation]
+
+    @classmethod
+    def poll(cls, context):
+        return context.object
 
     def execute(self, context):
         obj = context.object
-        obj.face_maps.active_index = self.face_map_index
+        if context.object.mode != 'EDIT' and self.operation in {'add', 'remove'}:
+            self.report('ERROR_INVALID_CONTEXT',
+                        f'The operator does not support "{self.operation}" operation in object mode')
+            return {'CANCELLED'}
+        if context.object.mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(obj.data)
+            f_lay = bm.faces.layers.string.get('Facade name')
+            if f_lay is None:
+                f_lay = bm.faces.layers.string.new('Facade name')
         if self.operation == 'add':
-            return bpy.ops.object.face_map_assign()
+            for face in (f for f in bm.faces if f.select):
+                face[f_lay] = self.facade_name.encode()
         elif self.operation == 'remove':
-            return bpy.ops.object.face_map_remove_from()
+            for face in (f for f in bm.faces if f.select):
+                if face[f_lay].decode() == self.facade_name:
+                    face[f_lay] = ''.encode()
+        elif self.operation == 'rename':
+            if obj.mode == 'EDIT':
+                for face in bm.faces:
+                    if face[f_lay].decode() == self.facade_name:
+                        face[f_lay] = self.new_facade_name.encode()
+            else:
+                attr = obj.data.attributes.get('Facade name')
+                if attr is None:
+                    attr = obj.data.attributes.new('Facade name', 'STRING', 'FACE')
+                for face_attr in attr.data.values():
+                    if face_attr.value == self.facade_name:
+                        face_attr.value = self.new_facade_name
+        try:
+            obj.building_props.facade_style.apply(obj)
+        except:
+            traceback.print_exc()
         return {'FINISHED'}
 
 
@@ -1224,29 +1300,14 @@ class Facade:
 
 
 class Building:
-    def __init__(self, base_bm):
+    def __init__(self):
         bm = bmesh.new()
         self.norm_lay = bm.verts.layers.float_vector.new("Normal")
         self.scale_lay = bm.verts.layers.float_vector.new("Scale")
         self.ind_lay = bm.verts.layers.int.new("Wall index")
         self.bm: bmesh.types.BMesh = bm
-        self.base_bm = base_bm
         self.cur_facade: Facade = None
         self.cur_floor: Floor = None
-
-    def facades(self) -> Iterable[Facade]:
-        wall_lay = self.base_bm.faces.layers.int.get("Is wall")
-        if wall_lay is None:
-            wall_lay = self.base_bm.faces.layers.int.new("Is wall")
-
-        for fi, face in enumerate(self.base_bm.faces):
-            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
-            is_valid = not isclose(face.calc_area(), 0, abs_tol=0.1)
-            if is_vertical and is_valid:
-                face[wall_lay] = 1
-                yield Facade(face, fi)
-            else:
-                face[wall_lay] = 0
 
     @staticmethod
     def calc_azimuth(vec: Vector):
