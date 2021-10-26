@@ -7,7 +7,7 @@ from enum import Enum, auto
 from graphlib import TopologicalSorter
 from itertools import count, chain, cycle
 from math import isclose
-from typing import Optional, Iterable, NamedTuple, Type, get_type_hints
+from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any
 
 import bmesh
 import bpy
@@ -501,17 +501,22 @@ class PanelRandomizeNode(BaseNode, Node):
     Inputs = namedtuple('Inputs', ['seed', 'panel0', 'panel1', 'panel2', 'panel3'])
 
     def node_init(self):
-        self.inputs.new(IntSocket.bl_idname, "Seed")
+        self.inputs.new(IntSocket.bl_idname, "Seed").display_shape = 'DIAMOND_DOT'
         self.inputs.new(PanelSocket.bl_idname, "")
         self.outputs.new(PanelSocket.bl_idname, "")
 
     @staticmethod
     def execute(inputs: Inputs, params):
-        random_stream = random.Random(inputs.seed(None))
+        random_streams = dict()
 
         def randomize_panels(build: Building):
+            seed = int(inputs.seed(build))
+            rand_stream = random_streams.get(seed)
+            if rand_stream is None:
+                rand_stream = random.Random(seed)
+                random_streams[seed] = rand_stream
             panels = [inp(build) for inp in inputs[1: -1]]
-            return random_stream.choices(panels, weights=[p.probability for p in panels])[0]
+            return rand_stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
 
 
@@ -643,6 +648,7 @@ class FloorAttributesNode(BaseNode, Node):
             return None
 
         def floor_index(build: Building):
+            build.cur_floor.depth.add('floor_index')
             return build.cur_floor.index
 
         def left_corner_angle(build: Building):
@@ -714,17 +720,20 @@ class FacadePatternNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         def facade_generator(build: Building):
-            facade = build.cur_facade
+            first_floor = None
+            fill_floors = []
+            is_fill_fixed = False
+            fill_repeat = 0
+            last_floor = None
             floors_height = 0
-            floor_fs = []
             cur_floor_ind = 0
             if inputs.first:
                 floor: Floor = Floor(index=cur_floor_ind)
                 cur_floor_ind += 1
                 build.cur_floor = floor
-                inputs.first(build, precompute=True)
+                inputs.first(build)
                 floors_height += floor.height
-                floor_fs.append(inputs.first)
+                first_floor = floor
             if inputs.fill:
                 for i in range(cur_floor_ind, 10000):
                     if inputs.last:
@@ -733,7 +742,8 @@ class FacadePatternNode(BaseNode, Node):
                         inputs.last(build, precompute=True)
                         if build.cur_facade.height < (floors_height + floor.height):
                             floors_height += floor.height
-                            floor_fs.append(inputs.last)
+                            inputs.last(build)
+                            last_floor = floor
                             cur_floor_ind += 1
                             break
                         else:
@@ -741,24 +751,58 @@ class FacadePatternNode(BaseNode, Node):
                     else:
                         if build.cur_facade.height < floors_height:
                             break
-                    floor: Floor = Floor(index=cur_floor_ind)
-                    cur_floor_ind += 1
-                    build.cur_floor = floor
-                    inputs.fill(build, precompute=True)
-                    floors_height += floor.height
-                    floor_fs.append(inputs.fill)
+                    if not is_fill_fixed:
+                        floor: Floor = Floor(index=cur_floor_ind)
+                        cur_floor_ind += 1
+                        build.cur_floor = floor
+                        inputs.fill(build)
+                        floors_height += floor.height
+                        fill_floors.append(floor)
+                        if 'floor_index' not in floor.depth:
+                            is_fill_fixed = True
+                    else:
+                        cur_floor_ind += 1
+                        floors_height += fill_floors[0].height
+                        fill_repeat += 1
 
+            facade = build.cur_facade
             z_scale = facade.height / floors_height
-            floors_height = 0
-            for fi, floor_f in enumerate(floor_fs):
-                floor: Floor = Floor(index=fi)
-                build.cur_floor = floor
-                floor_f(build)
-                height = floor.height * z_scale
-                for v in floor.verts:
-                    v.co += Vector((0, 0, floors_height + height / 2))
+            real_floors_height = 0
+            floors_ind = count()
+            if first_floor:
+                height = first_floor.height * z_scale
+                for v in first_floor.verts:
+                    v.co += Vector((0, 0, real_floors_height + height / 2))
                     v[build.scale_lay] *= Vector((1, z_scale, 1))
-                floors_height += height
+                real_floors_height += height
+                next(floors_ind)
+            if fill_floors:
+                for floor in fill_floors:
+                    height = floor.height * z_scale
+                    for v in floor.verts:
+                        v.co += Vector((0, 0, real_floors_height + height / 2))
+                        v[build.scale_lay] *= Vector((1, z_scale, 1))
+                    real_floors_height += height
+                    next(floors_ind)
+                if is_fill_fixed:
+                    fill_floor_height = 0
+                    for _ in range(fill_repeat):
+                        floor = fill_floors[0]
+                        next(floors_ind)
+                        height = floor.height * z_scale
+                        for v in floor.verts:
+                            new_v = build.bm.verts.new(v.co, v)
+                            new_v.co += Vector((0, 0, fill_floor_height + height))
+                        fill_floor_height += height
+                        real_floors_height += height
+            if last_floor:
+                height = last_floor.height * z_scale
+                for v in last_floor.verts:
+                    v.co += Vector((0, 0, real_floors_height + height / 2))
+                    v[build.scale_lay] *= Vector((1, z_scale, 1))
+                real_floors_height += height
+                next(floors_ind)
+
         return facade_generator
 
     @staticmethod
@@ -1285,8 +1329,6 @@ class Facade:
         z_dir = (left_low.co - right_up.co) * Vector((0, 0, 1))
         z_len = z_dir.length
 
-        # self.vertices: bmesh.types.BMVertSeq = vertices
-        # self.index = index
         self.cur_floor_ind = None
         self.cur_panel_ind = None
         self.height = z_len
@@ -1323,6 +1365,7 @@ class Floor:
         self.index = index
         self.height = None
         self.repeatable = False
+        self.depth: set[Literal['floor_index']] = set()
 
 
 class Panel:
