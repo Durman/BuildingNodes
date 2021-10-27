@@ -12,7 +12,7 @@ from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal
 import bmesh
 import bpy
 from bpy.app.handlers import persistent
-from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup
+from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
 import nodeitems_utils
 from mathutils import Vector
 from nodeitems_utils import NodeCategory, NodeItem
@@ -240,7 +240,19 @@ class ObjectSocket(BaseSocket, NodeSocket):
     default_name = 'Object'
     color = 1.0, 0.6, 0.45, 1.0
     show_text = False
-    value: bpy.props.PointerProperty(type=bpy.types.Object, update=BaseSocket.update_value)
+
+    def poll_objects(self, obj):
+        if obj.type != 'MESH':
+            return False
+        props: ObjectProperties = obj.building_props
+        if props.facade_style == self.id_data:  # object can't be instanced inside itself
+            return False
+        scl_attr, wal_attr = obj.data.attributes.get('Scale'), obj.data.attributes.get('Wall index')
+        if obj.name.split('.')[0] == 'Points' and scl_attr and wal_attr:  # most likely it's helper object
+            return False
+        return True
+
+    value: bpy.props.PointerProperty(type=bpy.types.Object, update=BaseSocket.update_value, poll=poll_objects)
 
 
 class IntSocket(BaseSocket, NodeSocket):
@@ -270,9 +282,17 @@ class BoolSocket(BaseSocket, NodeSocket):
 class VectorSocket(BaseSocket, NodeSocket):
     bl_idname = 'VectorSocket'
     bl_label = "Vector Socket"
-    default_name = 'Bool'
+    default_name = 'Vector'
     color = 0.4, 0.3, 0.7, 1.0
     value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value)
+
+
+class Vector4Socket(BaseSocket, NodeSocket):
+    bl_idname = 'Vector4Socket'
+    bl_label = "Vector 4 Socket"
+    default_name = 'Vector4'
+    color = 0.4, 0.3, 0.7, 1.0
+    value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value, size=4)
 
 
 class Categories(Enum):
@@ -288,6 +308,21 @@ class Categories(Enum):
             Categories.FACADE: (0.4, 0.25, 0.4),
         }
         return colors[self]
+
+
+class ShowSocketsMenu(Menu):
+    bl_idname = "OBJECT_MT_show_sockets"
+    bl_label = "Show/hide sockets"
+
+    def draw(self, context):
+        for sock in context.node.inputs:
+            if sock.is_linked:
+                col = self.layout.column()
+                col.active = False
+                col.prop(sock, 'enabled', text=(sock.name or sock.default_name) + ' (connected)', emboss=False)
+            else:
+                col = self.layout.column()
+                col.prop(sock, 'enabled', text=sock.name or sock.default_name)
 
 
 class BaseNode:
@@ -402,7 +437,7 @@ class PanelNode(BaseNode, Node):
     bl_idname = 'PanelNode'
     bl_label = "Panel"
     category = Categories.PANEL
-    Inputs = namedtuple('Inputs', ['object', 'scalable'])
+    Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding'])
     Props = namedtuple('Props', ['panel_index'])
 
     mode: bpy.props.EnumProperty(items=[(i, i, '') for i in ['Object', 'Collection']])
@@ -410,20 +445,33 @@ class PanelNode(BaseNode, Node):
 
     def node_init(self):
         self.inputs.new(ObjectSocket.bl_idname, "")
-        self.inputs.new(BoolSocket.bl_idname, "Scalable")
+        self.inputs.new(BoolSocket.bl_idname, "Scalable").enabled = False
+        self.inputs.new(Vector4Socket.bl_idname, 'Scope padding').enabled = False
         self.outputs.new(PanelSocket.bl_idname, "")
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "mode", expand=True)
+        row = layout.row(align=True)
+        row.prop(self, "mode", expand=True)
+        row.menu(ShowSocketsMenu.bl_idname, text='', icon='DOWNARROW_HLT')
 
     @staticmethod
     def execute(inputs: Inputs, props: Props):
         def panel_gen(build: Building):
             # panel is expected to be in XY orientation
-            verts = inputs.object(build).data.vertices
+            obj = inputs.object(build)
+            if obj.mode == 'EDIT':
+                bm = bmesh.from_edit_mesh(obj.data)
+                sc_lay = bm.verts.layers.int.get('Is scope')
+                verts = [v for v in bm.verts if v[sc_lay]] if sc_lay else list(bm.verts)
+            else:
+                attr = obj.data.attributes.get('Is scope')
+                verts = [v for v, a in zip(obj.data.vertices, attr.data.values()) if a.value]\
+                    if attr else obj.data.vertices
             min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts)))
             max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts)))
-            return Panel(props.panel_index, min_v, max_v)
+            panel = Panel(props.panel_index, min_v, max_v)
+            panel.set_scope_padding(inputs.scope_padding(build))  # for now it works only as scale
+            return panel
         return panel_gen
 
 
@@ -899,7 +947,7 @@ class ObjectPanel(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Building nodes"
-    bl_label = "Active object"
+    bl_label = "Building properties"
 
     def draw(self, context):
         col = self.layout.column()
@@ -941,6 +989,19 @@ class ObjectPanel(Panel):
 
         else:
             col.label(text='Select object')
+
+
+class PanelPanel(Panel):
+    bl_idname = "VIEW3D_PT_PanelPanel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Building nodes"
+    bl_label = "Panel properties"
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.operator(EditPanelAttributesOperator.bl_idname, text="Set scope").operation = 'set_scope'
+        # col.operator(EditPanelAttributesOperator.bl_idname, text="Origin to scope center").operation = 'set_origin'
 
 
 class GeometryTreeInterface:
@@ -1105,6 +1166,14 @@ class ObjectProperties(PropertyGroup):
         default=True, description='Use facade style during render', update=update_show_in_render)
     show_facade_names: bpy.props.BoolProperty(name='Named facades', default=True)
     facade_names_mapping: bpy.props.CollectionProperty(type=FacadeNamesMapping)
+
+    def apply_style(self):
+        if self.id_data.mode == 'EDIT':
+            can_be_updated = self.facade_style and self.realtime and self.show_in_edit_mode
+        else:
+            can_be_updated = self.facade_style and self.realtime
+        if can_be_updated:
+            self.facade_style.apply(self.id_data)
 
     def get_modifier(self) -> Optional[bpy.types.Modifier]:
         obj = self.id_data
@@ -1289,12 +1358,56 @@ class EditFacadeAttributesOperator(Operator):
         return {'FINISHED'}
 
 
+class EditPanelAttributesOperator(Operator):
+    bl_idname = "bn.edit_panel_attributes"
+    bl_label = "Edit panel attributes"
+    bl_options = {'INTERNAL', }
+
+    operation: bpy.props.EnumProperty(items=[(i, i, '') for i in ['set_scope', 'set_origin']])
+
+    @classmethod
+    def description(cls, context, properties):
+        descriptions = {
+            'set_scope': "Mark selected points as scope of the panel",
+            # 'set_origin': "Put origin into the center of the panel scope or bounding box",
+        }
+        return descriptions[properties.operation]
+
+    @classmethod
+    def poll(cls, context):
+        return context.object and context.object.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.object
+        bm = bmesh.from_edit_mesh(obj.data)
+        sc_lay = bm.verts.layers.int.get('Is scope') or bm.verts.layers.int.new('Is scope')
+        if self.operation == 'set_scope':
+            for vert in bm.verts:
+                vert[sc_lay] = vert.select
+            points = [v for v in bm.verts if v[sc_lay]] or bm.verts
+            # center = Vector((sum(v.x for v in points) / len(points), sum(v.y for v in points) / len(points),
+            #                  sum(v.z for v in points) / len(points)))
+            center = Geometry(points).get_bounding_center()
+            obj.location += center
+            for vert in bm.verts:
+                vert.co -= center
+        obj.data.update()
+        for fac_obj in (o for o in bpy.data.objects if o.building_props.facade_style):
+            props: ObjectProperties = fac_obj.building_props
+            if obj in {panel for panel in props.facade_style.inst_col.objects}:
+                try:
+                    props.apply_style()
+                except Exception:
+                    traceback.print_exc()
+        return {'FINISHED'}
+
+
 classes = dict()
 for name, member in inspect.getmembers(sys.modules[__name__]):
     is_module_cls = inspect.isclass(member) and member.__module__ == __name__
     if is_module_cls:
         if any(base_cls in member.__bases__ for base_cls
-               in [NodeTree, NodeSocket, Node, Panel, Operator, PropertyGroup]):
+               in [NodeTree, NodeSocket, Node, Panel, Operator, PropertyGroup, Menu]):
             # property groups should be added before dependent classes
             # (doesn't take into account dependent Property groups)
             for annotation in get_type_hints(member).values():
@@ -1374,11 +1487,30 @@ class Panel:
         vec_size = max_vector - min_vector
         self.width = vec_size.x
         self.height = vec_size.y
-        self.index = index
+        self.index = index  # index of object in the collection
         self.probability = 1
         self.width_scale = 1
         self.height_scale = 1
 
+    def set_scope_padding(self, padding):
+        self.height += padding[0] + padding[2]
+        self.width += padding[1] + padding[3]
+
+
+class Geometry:
+    def __init__(self, verts: list):
+        self.verts = verts
+
+    def get_bounding_verts(self) -> tuple[Vector, Vector]:  # min, max
+        min_v = Vector((min(v.co.x for v in self.verts), min(v.co.y for v in self.verts),
+                        min(v.co.z for v in self.verts)))
+        max_v = Vector((max(v.co.x for v in self.verts), max(v.co.y for v in self.verts),
+                        max(v.co.z for v in self.verts)))
+        return min_v, max_v
+
+    def get_bounding_center(self) -> Vector:
+        min_v, max_v = self.get_bounding_verts()
+        return (max_v - min_v) * 0.5 + min_v
 
 def update_tree_timer():
     if BuildingGenerator.was_changes:
