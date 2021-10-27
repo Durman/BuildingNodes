@@ -75,6 +75,7 @@ class BuildingGenerator(NodeTree):
                     in_data.append(sock_value)
                 else:
                     in_data.append(None)
+
             if node.bl_idname == FacadeInstanceNode.bl_idname:
                 return node.execute(node.gen_input_mapping()(*in_data), base_bm, obj_facade_names)
             else:
@@ -82,10 +83,7 @@ class BuildingGenerator(NodeTree):
                     props = node.Props(*[getattr(node, n) for n in node.Props._fields])
                 else:
                     props = None
-                if node.repeat_last_socket:
-                    res = node.execute(node.gen_input_mapping()(*in_data), props)
-                else:
-                    res = node.execute(node.Inputs(*in_data) if hasattr(node, 'Inputs') else None, props)
+                res = node.execute(Inp(*in_data) if (Inp := node.gen_input_mapping()) is not None else None, props)
                 if not isinstance(res, tuple):
                     res = (res, )
                 for data, out_sok in zip(res, node.outputs):
@@ -173,6 +171,16 @@ class BuildingGenerator(NodeTree):
                     sock_names: FacadeTreeNames = self.facade_names.add()
                     sock_names.identifier = socket.identifier
                     sock_names.user_name = socket.user_name or socket.default_name
+
+    def update_sockets(self):
+        """Supports only adding sockets to the end of input output collections"""
+        for node in self.nodes:
+            for sock, template in zip(chain(node.inputs, [None]), node.input_template):
+                if sock is None:
+                    template.init(node, is_input=True)
+            for sock, template in zip(chain(node.outputs, [None]), node.output_template):
+                if sock is None:
+                    template.init(node, is_input=False)
 
 
 class BaseSocket:
@@ -325,19 +333,46 @@ class ShowSocketsMenu(Menu):
                 col.prop(sock, 'enabled', text=sock.name or sock.default_name)
 
 
+class SocketTemplate(NamedTuple):
+    type: NodeSocket
+    name: str = ''
+    enabled: bool = True
+    display_shape: Literal['CIRCLE', 'SQUARE', 'DIAMOND', 'CIRCLE_DOT', 'SQUARE_DOT', 'DIAMOND_DOT'] = None
+    value: Any = None
+
+    def init(self, node: Node, is_input):
+        node_sockets = node.inputs if is_input else node.outputs
+        sock = node_sockets.new(self.type.bl_idname, self.name)
+        if not self.enabled:
+            sock.enabled = False
+        if self.display_shape:
+            sock.display_shape = self.display_shape
+        if self.value is not None:
+            sock.value = self.value
+
+
 class BaseNode:
     category: Categories = None
     repeat_last_socket = False
     repeat_first_socket = False
+    input_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
+    output_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
 
     @classmethod
     def poll(cls, tree):
-        return tree.bl_idname == 'BuildingGenerator'
+        return tree.bl_idname == BuildingGenerator.bl_idname
 
     def init(self, context):
+        # update node colors
         if self.category is not None:
             self.use_custom_color = True
             self.color = self.category.color
+        # create sockets
+        for s_template in self.input_template:
+            s_template.init(self, is_input=True)
+        for s_template in self.output_template:
+            s_template.init(self, is_input=False)
+
         self.node_init()
 
     def node_init(self):
@@ -370,15 +405,16 @@ class BaseNode:
     def execute(inputs, props):
         pass
 
-    def gen_input_mapping(self) -> Type[NamedTuple]:
+    def gen_input_mapping(self) -> Optional[Type[NamedTuple]]:
         input_names = []
         index = count()
-        for sock in self.inputs:
-            if sock.name:
-                input_names.append(sock.name.lower())
-            else:
-                input_names.append(sock.default_name.lower() + str(next(index)))
-        return namedtuple('Inputs', input_names)
+        if self.repeat_last_socket or self.bl_idname == FacadeInstanceNode.bl_idname:
+            for sock in self.inputs:
+                inp_name = sock.name or sock.default_name + str(next(index))
+                input_names.append(inp_name.lower().replace(' ', '_'))
+        elif hasattr(self, 'Inputs'):
+            return self.Inputs
+        return namedtuple('Inputs', input_names) if input_names else None
 
 
 class FacadeInstanceNode(BaseNode, Node):
@@ -439,15 +475,15 @@ class PanelNode(BaseNode, Node):
     category = Categories.PANEL
     Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding'])
     Props = namedtuple('Props', ['panel_index'])
+    input_template = Inputs(
+        SocketTemplate(ObjectSocket),
+        SocketTemplate(BoolSocket, 'Scalable', enabled=False),
+        SocketTemplate(Vector4Socket, 'Scope padding', enabled=False),
+    )
+    output_template = [SocketTemplate(PanelSocket)]
 
     mode: bpy.props.EnumProperty(items=[(i, i, '') for i in ['Object', 'Collection']])
     panel_index: bpy.props.IntProperty(description="Penal index in the collection")
-
-    def node_init(self):
-        self.inputs.new(ObjectSocket.bl_idname, "")
-        self.inputs.new(BoolSocket.bl_idname, "Scalable").enabled = False
-        self.inputs.new(Vector4Socket.bl_idname, 'Scope padding').enabled = False
-        self.outputs.new(PanelSocket.bl_idname, "")
 
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
@@ -1562,6 +1598,8 @@ def register():
     bpy.app.handlers.depsgraph_update_post.append(update_active_object)
     bpy.app.handlers.load_post.append(update_tree_timer)  # this is hack to store function somewhere
     bpy.app.timers.register(update_tree_timer, persistent=True)
+    for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingGenerator.bl_idname):
+        tree.update_sockets()  # todo should be used on file loading
 
 
 def unregister():
