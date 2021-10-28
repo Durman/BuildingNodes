@@ -182,6 +182,11 @@ class BuildingGenerator(NodeTree):
                 if sock is None:
                     template.init(node, is_input=False)
 
+    def show_in_areas(self, is_to_show):
+        for area in bpy.context.screen.areas:
+            if area.ui_type == BuildingGenerator.bl_idname:
+                area.spaces[0].node_tree = self if is_to_show else None
+
 
 class BaseSocket:
     show_text = True
@@ -1000,7 +1005,8 @@ class ObjectPanel(Panel):
             row.prop(props, 'realtime', text='', icon='RESTRICT_VIEW_OFF' if props.realtime else 'RESTRICT_VIEW_ON')
             row.prop(props, 'show_in_render', text='',
                      icon='RESTRICT_RENDER_OFF' if props.show_in_render else 'RESTRICT_RENDER_ON')
-            col.template_ID(props, 'facade_style', new='bn.add_new_facade_style')
+            col.template_ID(props, 'facade_style', new=AddNewFacadeStyleOperator.bl_idname,
+                            unlink=UnlinkFacadeStyleOperator.bl_idname)
 
             col.prop(props, 'show_facade_names',
                      icon='DOWNARROW_HLT' if props.show_facade_names else 'RIGHTARROW', emboss=False)
@@ -1022,7 +1028,6 @@ class ObjectPanel(Panel):
                     add_op = row.operator(EditFacadeAttributesOperator.bl_idname, text='Add to fill facade', icon='ADD')
                     add_op.operation = 'add'
                     add_op.facade_name = ''
-
         else:
             col.label(text='Select object')
 
@@ -1251,6 +1256,7 @@ class ObjectProperties(PropertyGroup):
 class AddNewFacadeStyleOperator(Operator):
     bl_idname = "bn.add_new_facade_style"
     bl_label = "Add new facade style"
+    bl_description = "Add new facade style to the object"
     bl_options = {'INTERNAL', }
 
     @classmethod
@@ -1260,7 +1266,37 @@ class AddNewFacadeStyleOperator(Operator):
     def execute(self, context):
         obj = context.object
         obj_props: ObjectProperties = obj.building_props
-        obj_props.facade_style = bpy.data.node_groups.new("FacadeStyle", BuildingGenerator.bl_idname)
+        tree = bpy.data.node_groups.new("FacadeStyle", BuildingGenerator.bl_idname)
+        node1 = tree.nodes.new(PanelNode.bl_idname)
+        node2 = tree.nodes.new(FloorPatternNode.bl_idname)
+        node3 = tree.nodes.new(FacadePatternNode.bl_idname)
+        node4 = tree.nodes.new(FacadeInstanceNode.bl_idname)
+        tree.links.new(node2.inputs[1], node1.outputs[0])
+        tree.links.new(node3.inputs[1], node2.outputs[0])
+        tree.links.new(node4.inputs[0], node3.outputs[0])
+        node2.location = Vector((200, 0))
+        node3.location = Vector((400, 0))
+        node4.location = Vector((600, 0))
+        obj_props.facade_style = tree
+        tree.show_in_areas(True)
+        return {'FINISHED'}
+
+
+class UnlinkFacadeStyleOperator(Operator):
+    bl_idname = "bn.unlink_facade_style"
+    bl_label = "Unlink facade style"
+    bl_description = "Unlink facade style from the object"
+    bl_options = {'INTERNAL', }
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None
+
+    def execute(self, context):
+        obj = context.object
+        obj_props: ObjectProperties = obj.building_props
+        obj_props.facade_style.show_in_areas(False)
+        obj_props.facade_style = None
         return {'FINISHED'}
 
 
@@ -1572,6 +1608,19 @@ def update_tree_timer():
 @persistent
 def update_active_object(scene):
     obj = bpy.context.object
+
+    # change active object event, update tree property of Building tree editors
+    try:  # todo also changes of the tree editor type should tracked
+        if (prev_obj := scene['active_obj']) != obj:
+            scene['active_obj'] = obj
+            if cur_tree := obj.building_props.facade_style:
+                cur_tree.show_in_areas(True)
+            elif prev_tree := prev_obj.building_props.facade_style:
+                prev_tree.show_in_areas(False)
+    except KeyError:
+        scene['active_obj'] = obj
+
+    # update active object
     if obj is None:
         return
     obj_props: ObjectProperties = obj.building_props
