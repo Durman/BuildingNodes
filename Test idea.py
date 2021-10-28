@@ -309,9 +309,10 @@ class Vector4Socket(BaseSocket, NodeSocket):
 
 
 class Categories(Enum):
-    PANEL = auto()
-    FLOOR = auto()
     FACADE = auto()
+    FLOOR = auto()
+    PANEL = auto()
+    UTILS = auto()
 
     @property
     def color(self):
@@ -320,7 +321,7 @@ class Categories(Enum):
             Categories.FLOOR: (0.25, 0.25, 0.4),
             Categories.FACADE: (0.4, 0.25, 0.4),
         }
-        return colors[self]
+        return colors.get(self)
 
 
 class ShowSocketsMenu(Menu):
@@ -1490,17 +1491,6 @@ for name, member in inspect.getmembers(sys.modules[__name__]):
             classes[member] = None
 
 
-class AllNodes(NodeCategory):
-    @classmethod
-    def poll(cls, context):
-        return context.space_data.tree_type == BuildingGenerator.bl_idname
-
-
-node_categories = [
-    AllNodes('ALL_NODES', "All nodes", items=[NodeItem(cls.bl_idname) for cls in classes if BaseNode in cls.__bases__])
-]
-
-
 class Facade:
     def __init__(self, face, index):
         center = face.calc_center_median()
@@ -1638,11 +1628,25 @@ def update_active_object(scene):
             obj_props.facade_style.apply(obj)
 
 
+def get_node_categories():
+    class Base:
+        @classmethod
+        def poll(cls, context):
+            return context.space_data.tree_type == BuildingGenerator.bl_idname
+
+    category_classes = {c: type(c.name.lower(), (Base, NodeCategory), {}) for c in Categories}
+    category_items = {c: [] for c in Categories}
+    for node_cls in (c for c in classes if BaseNode in c.__bases__):
+        category_items[node_cls.category or Categories.UTILS].append(NodeItem(node_cls.bl_idname))
+    return [category_classes[cat](cat.name, cat.name.capitalize().replace('_', ' '), items=category_items[cat])
+            for cat in Categories]
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    nodeitems_utils.register_node_categories('CUSTOM_NODES', node_categories)
+    nodeitems_utils.register_node_categories('CUSTOM_NODES', get_node_categories())
     bpy.types.Object.building_props = bpy.props.PointerProperty(type=ObjectProperties)
     bpy.app.handlers.depsgraph_update_post.append(update_active_object)
     bpy.app.handlers.load_post.append(update_tree_timer)  # this is hack to store function somewhere
