@@ -448,14 +448,14 @@ class FacadeInstanceNode(BaseNode, Node):
         f_lay = base_bm.faces.layers.string.get('Facade name') or base_bm.faces.layers.string.new('Facade name')
         wall_lay = base_bm.faces.layers.int.get("Is wall") or base_bm.faces.layers.int.new("Is wall")
 
-        for fi, face in enumerate(base_bm.faces):
+        for face in base_bm.faces:
             is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
-            is_valid = not isclose(face.calc_area(), 0, abs_tol=0.1)
+            is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
             facade_name = face[f_lay].decode()
             facade_func = inputs[ind] if (ind := input_ind.get(facade_name, 0)) < len(inputs) else inputs[0]
-            if is_vertical and is_valid and facade_func:
+            if is_valid and facade_func:
                 face[wall_lay] = 1
-                build.cur_facade = Facade(face, fi)
+                build.cur_facade = Facade(face)
                 facade_func(build)
             else:
                 face[wall_lay] = 0
@@ -511,7 +511,7 @@ class PanelNode(BaseNode, Node):
                     if attr else obj.data.vertices
             min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts)))
             max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts)))
-            panel = Panel(props.panel_index, min_v, max_v)
+            panel = Panel(props.panel_index, max_v - min_v)
             panel.set_scope_padding(inputs.scope_padding(build))  # for now it works only as scale
             return panel
         return panel_gen
@@ -663,55 +663,45 @@ class FloorPatternNode(BaseNode, Node):
         def floor_gen(build: Building, precompute=False):
             if precompute:
                 build.cur_floor.height = inputs.height(build)
-                build.cur_floor.repeatable = False
                 return
 
             panels = []
-            panels_len = 0
+            panels_width = 0
             right_panel = None
             if inputs.left:
                 build.cur_facade.cur_panel_ind = 0
                 panel: Panel = inputs.left(build)
                 if panel is not None:
-                    z_scale = inputs.height(build) / panel.height
-                    panels_len += panel.width * z_scale
-                    panel.height_scale = z_scale
+                    z_scale = inputs.height(build) / panel.size.y
+                    panel.scale *= Vector((z_scale, z_scale))
+                    panels_width += panel.instance_size.x
                     panels.append(panel)
             if inputs.right:
                 build.cur_facade.cur_panel_ind = 0
                 panel: Panel = inputs.right(build)
                 if panel is not None:
-                    z_scale = inputs.height(build) / panel.height
-                    panels_len += panel.width * z_scale
-                    panel.height_scale = z_scale
+                    z_scale = inputs.height(build) / panel.size.y
+                    panel.scale *= Vector((z_scale, z_scale))
+                    panels_width += panel.instance_size.x
                     right_panel = panel
-            if panels_len < build.cur_facade.width:
+            if panels_width < build.cur_facade.width:
                 for i in range(10000):
                     build.cur_facade.cur_panel_ind = i
                     panel: Panel = inputs.fill(build)
-                    z_scale = inputs.height(build) / panel.height
-                    panels_len += panel.width * z_scale
-                    panel.height_scale = z_scale
+                    z_scale = inputs.height(build) / panel.size.y
+                    panel.scale *= Vector((z_scale, z_scale))
+                    panels_width += panel.instance_size.x
                     panels.append(panel)
-                    if panels_len > build.cur_facade.width:
+                    if panels_width > build.cur_facade.width:
                         break
             if right_panel:
                 panels.append(right_panel)
-            verts = []
-            facade = build.cur_facade
-            xy_scale = facade.width / panels_len
-            xy_shift = 0
-            zero_panel = Panel(0, Vector((0, 0)), Vector((0, 0)))
-            for prev_pan, pan in zip(chain([zero_panel], panels), panels):
-                prev_half_size = prev_pan.width * prev_pan.height_scale * xy_scale / 2
-                half_size = pan.width * pan.height_scale * xy_scale / 2
-                xy_shift += prev_half_size + half_size
-                vec = build.bm.verts.new(facade.start + facade.direction.normalized() * xy_shift)
-                vec[build.norm_lay] = facade.normal
-                vec[build.scale_lay] = (pan.height_scale * xy_scale, pan.height_scale, 1)
-                vec[build.ind_lay] = pan.index
-                verts.append(vec)
-            build.cur_floor.verts = verts
+
+            xy_scale = build.cur_facade.width / panels_width
+            for panel in panels:
+                panel.scale *= Vector((xy_scale, 1))
+            build.cur_floor.panels = panels
+            build.cur_floor.set_xy_location(build)
             build.cur_floor.height = inputs.height(build)
         return floor_gen
 
@@ -855,41 +845,41 @@ class FacadePatternNode(BaseNode, Node):
                         floors_height += fill_floors[0].height
                         fill_repeat += 1
 
-            facade = build.cur_facade
-            z_scale = facade.height / floors_height
+            z_scale = build.cur_facade.height / floors_height
             real_floors_height = 0
             floors_ind = count()
             if first_floor:
                 height = first_floor.height * z_scale
-                for v in first_floor.verts:
-                    v.co += Vector((0, 0, real_floors_height + height / 2))
-                    v[build.scale_lay] *= Vector((1, z_scale, 1))
+                for panel in first_floor.panels:
+                    panel.location += Vector((0, 0, real_floors_height + height / 2))
+                    panel.scale *= Vector((1, z_scale))
+                    panel.instance(build)
                 real_floors_height += height
                 next(floors_ind)
             if fill_floors:
                 for floor in fill_floors:
                     height = floor.height * z_scale
-                    for v in floor.verts:
-                        v.co += Vector((0, 0, real_floors_height + height / 2))
-                        v[build.scale_lay] *= Vector((1, z_scale, 1))
+                    for panel in floor.panels:
+                        panel.location += Vector((0, 0, real_floors_height + height / 2))
+                        panel.scale *= Vector((1, z_scale))
+                        panel.instance(build)
                     real_floors_height += height
                     next(floors_ind)
                 if is_fill_fixed:
-                    fill_floor_height = 0
+                    floor = fill_floors[0]
+                    height = floor.height * z_scale
                     for _ in range(fill_repeat):
-                        floor = fill_floors[0]
                         next(floors_ind)
-                        height = floor.height * z_scale
-                        for v in floor.verts:
-                            new_v = build.bm.verts.new(v.co, v)
-                            new_v.co += Vector((0, 0, fill_floor_height + height))
-                        fill_floor_height += height
+                        for panel in floor.panels:
+                            panel.location += Vector((0, 0, height))
+                            panel.instance(build)
                         real_floors_height += height
             if last_floor:
                 height = last_floor.height * z_scale
-                for v in last_floor.verts:
-                    v.co += Vector((0, 0, real_floors_height + height / 2))
-                    v[build.scale_lay] *= Vector((1, z_scale, 1))
+                for panel in last_floor.panels:
+                    panel.location += Vector((0, 0, real_floors_height + height / 2))
+                    panel.scale *= Vector((1, z_scale))
+                    panel.instance(build)
                 real_floors_height += height
                 next(floors_ind)
 
@@ -1491,8 +1481,52 @@ for name, member in inspect.getmembers(sys.modules[__name__]):
             classes[member] = None
 
 
+class Panel:
+    def __init__(self, obj_index: int, size: Vector):
+        # panel is expected to be in XY orientation
+        self.obj_index = obj_index  # index of object in the collection
+        self.size: Vector = size
+        self.location: Vector = None
+        self.scale: Vector = Vector((1, 1))
+
+        self.probability = 1
+
+    @property
+    def instance_size(self) -> Vector:
+        return self.size * self.scale
+
+    def set_scope_padding(self, padding):
+        self.size.x += padding[0] + padding[2]
+        self.size.y += padding[1] + padding[3]
+
+    def instance(self, build):
+        facade = build.cur_facade
+        vec = build.bm.verts.new(self.location)
+        vec[build.norm_lay] = facade.normal
+        vec[build.scale_lay] = (self.scale.x, self.scale.y, 1)
+        vec[build.ind_lay] = self.obj_index
+
+
+class Floor:
+    def __init__(self, index=None):
+        self.index = index
+        self.height = None
+        self.panels: list[Panel] = None
+        self.depth: set[Literal['floor_index']] = set()
+
+    def set_xy_location(self, build):
+        facade = build.cur_facade
+        xy_shift = 0
+        for pan in self.panels:
+            size = pan.instance_size.x
+            xy_shift += size / 2
+            location = facade.start + facade.direction.normalized() * xy_shift
+            pan.location = location
+            xy_shift += size / 2
+
+
 class Facade:
-    def __init__(self, face, index):
+    def __init__(self, face):
         center = face.calc_center_median()
         dot_prod = [((v.co - center).cross(face.normal)) @ Vector((0, 0, 1)) for v in face.verts]
         right_low, right_up = sorted([v for v, prod in zip(face.verts, dot_prod) if prod < 0], key=lambda v: v.co.z)
@@ -1511,6 +1545,7 @@ class Facade:
         self.start = left_low.co
         self.direction = xy_dir
         self.normal = face.normal
+
         self.left_wall_angle = left_edge.calc_face_angle()
         self.right_wall_angle = right_edge.calc_face_angle()
         self.azimuth = Building.calc_azimuth(self.normal)
@@ -1532,31 +1567,6 @@ class Building:
         north = Vector((0, 1, 0))
         is_right = vec.cross(north).normalized().z < 0
         return vec @ north + 3 if is_right else 1 - vec @ north
-
-
-class Floor:
-    def __init__(self, index=None):
-        self.verts: list[bmesh.types.BMVert] = None
-        self.index = index
-        self.height = None
-        self.repeatable = False
-        self.depth: set[Literal['floor_index']] = set()
-
-
-class Panel:
-    def __init__(self, index: int, min_vector: Vector, max_vector: Vector):
-        # panel is expected to be in XY orientation
-        vec_size = max_vector - min_vector
-        self.width = vec_size.x
-        self.height = vec_size.y
-        self.index = index  # index of object in the collection
-        self.probability = 1
-        self.width_scale = 1
-        self.height_scale = 1
-
-    def set_scope_padding(self, padding):
-        self.height += padding[0] + padding[2]
-        self.width += padding[1] + padding[3]
 
 
 class Geometry:
