@@ -2,7 +2,7 @@ import inspect
 import random
 import sys
 import traceback
-from collections import namedtuple, defaultdict
+from collections import namedtuple, defaultdict, deque
 from enum import Enum, auto
 from graphlib import TopologicalSorter
 from itertools import count, chain, cycle
@@ -11,6 +11,7 @@ from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal
 
 import bmesh
 import bpy
+from bmesh.types import BMEdge, BMFace, BMLoop, BMVert
 from bpy.app.handlers import persistent
 from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
 import nodeitems_utils
@@ -193,7 +194,7 @@ class BaseSocket:
     user_name: bpy.props.StringProperty(description="Socket name given by user")  # todo tag redraw
 
     def update_value(self, context):
-        self.id_data.update()
+        self.id_data.update()  # https://developer.blender.org/T92635
 
     def draw(self, context, layout, node, text):
         if hasattr(self, 'value') and not self.is_output and not self.is_linked:
@@ -665,44 +666,19 @@ class FloorPatternNode(BaseNode, Node):
                 build.cur_floor.height = inputs.height(build)
                 return
 
-            panels = []
-            panels_width = 0
-            right_panel = None
-            if inputs.left:
-                build.cur_facade.cur_panel_ind = 0
-                panel: Panel = inputs.left(build)
-                if panel is not None:
-                    z_scale = inputs.height(build) / panel.size.y
-                    panel.scale *= Vector((z_scale, z_scale))
-                    panels_width += panel.instance_size.x
-                    panels.append(panel)
-            if inputs.right:
-                build.cur_facade.cur_panel_ind = 0
-                panel: Panel = inputs.right(build)
-                if panel is not None:
-                    z_scale = inputs.height(build) / panel.size.y
-                    panel.scale *= Vector((z_scale, z_scale))
-                    panels_width += panel.instance_size.x
-                    right_panel = panel
-            if panels_width < build.cur_facade.width:
-                for i in range(10000):
-                    build.cur_facade.cur_panel_ind = i
-                    panel: Panel = inputs.fill(build)
-                    z_scale = inputs.height(build) / panel.size.y
-                    panel.scale *= Vector((z_scale, z_scale))
-                    panels_width += panel.instance_size.x
-                    panels.append(panel)
-                    if panels_width > build.cur_facade.width:
-                        break
-            if right_panel:
-                panels.append(right_panel)
-
-            xy_scale = build.cur_facade.width / panels_width
-            for panel in panels:
-                panel.scale *= Vector((xy_scale, 1))
-            build.cur_floor.panels = panels
-            build.cur_floor.set_xy_location(build)
             build.cur_floor.height = inputs.height(build)
+            pan_stack = build.cur_floor.panels_stack
+            if inputs.left:
+                pan_stack.add_panel(build, inputs.left, 'LEFT')
+            if inputs.right:
+                pan_stack.add_panel(build, inputs.right, 'RIGHT')
+            if not pan_stack.is_full(build):
+                for i in range(10000):
+                    pan_stack.add_panel(build, inputs.fill)
+                    if pan_stack.is_full(build):
+                        break
+
+            pan_stack.update_location_scale(build)
         return floor_gen
 
 
@@ -800,88 +776,28 @@ class FacadePatternNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         def facade_generator(build: Building):
-            first_floor = None
-            fill_floors = []
+            floors_stack = build.cur_facade.floors_stack
             is_fill_fixed = False
-            fill_repeat = 0
-            last_floor = None
-            floors_height = 0
-            cur_floor_ind = 0
             if inputs.first:
-                floor: Floor = Floor(index=cur_floor_ind)
-                cur_floor_ind += 1
-                build.cur_floor = floor
-                inputs.first(build)
-                floors_height += floor.height
-                first_floor = floor
+                floors_stack.add_floor(build, inputs.first)
             if inputs.fill:
-                for i in range(cur_floor_ind, 10000):
+                for i in range(10000):
                     if inputs.last:
-                        floor: Floor = Floor(index=cur_floor_ind)
-                        build.cur_floor = floor
-                        inputs.last(build, precompute=True)
-                        if build.cur_facade.height < (floors_height + floor.height):
-                            floors_height += floor.height
-                            inputs.last(build)
-                            last_floor = floor
-                            cur_floor_ind += 1
+                        if floors_stack.will_be_last_floor(build, inputs.last):
+                            floors_stack.add_floor(build, inputs.last)
                             break
-                        else:
-                            pass  # last floor can't be added yet
                     else:
-                        if build.cur_facade.height < floors_height:
+                        if floors_stack.is_full(build):
                             break
+
                     if not is_fill_fixed:
-                        floor: Floor = Floor(index=cur_floor_ind)
-                        cur_floor_ind += 1
-                        build.cur_floor = floor
-                        inputs.fill(build)
-                        floors_height += floor.height
-                        fill_floors.append(floor)
+                        floor = floors_stack.add_floor(build, inputs.fill)
                         if 'floor_index' not in floor.depth:
                             is_fill_fixed = True
                     else:
-                        cur_floor_ind += 1
-                        floors_height += fill_floors[0].height
-                        fill_repeat += 1
-
-            z_scale = build.cur_facade.height / floors_height
-            real_floors_height = 0
-            floors_ind = count()
-            if first_floor:
-                height = first_floor.height * z_scale
-                for panel in first_floor.panels:
-                    panel.location += Vector((0, 0, real_floors_height + height / 2))
-                    panel.scale *= Vector((1, z_scale))
-                    panel.instance(build)
-                real_floors_height += height
-                next(floors_ind)
-            if fill_floors:
-                for floor in fill_floors:
-                    height = floor.height * z_scale
-                    for panel in floor.panels:
-                        panel.location += Vector((0, 0, real_floors_height + height / 2))
-                        panel.scale *= Vector((1, z_scale))
-                        panel.instance(build)
-                    real_floors_height += height
-                    next(floors_ind)
-                if is_fill_fixed:
-                    floor = fill_floors[0]
-                    height = floor.height * z_scale
-                    for _ in range(fill_repeat):
-                        next(floors_ind)
-                        for panel in floor.panels:
-                            panel.location += Vector((0, 0, height))
-                            panel.instance(build)
-                        real_floors_height += height
-            if last_floor:
-                height = last_floor.height * z_scale
-                for panel in last_floor.panels:
-                    panel.location += Vector((0, 0, real_floors_height + height / 2))
-                    panel.scale *= Vector((1, z_scale))
-                    panel.instance(build)
-                real_floors_height += height
-                next(floors_ind)
+                        floors_stack.repeat_last()
+            floors_stack.instance_floors(build)
+            return True
 
         return facade_generator
 
@@ -1262,7 +1178,7 @@ class AddNewFacadeStyleOperator(Operator):
         node2 = tree.nodes.new(FloorPatternNode.bl_idname)
         node3 = tree.nodes.new(FacadePatternNode.bl_idname)
         node4 = tree.nodes.new(FacadeInstanceNode.bl_idname)
-        tree.links.new(node2.inputs[1], node1.outputs[0])
+        tree.links.new(node2.inputs[2], node1.outputs[0])
         tree.links.new(node3.inputs[1], node2.outputs[0])
         tree.links.new(node4.inputs[0], node3.outputs[0])
         node2.location = Vector((200, 0))
@@ -1499,30 +1415,107 @@ class Panel:
         self.size.x += padding[0] + padding[2]
         self.size.y += padding[1] + padding[3]
 
-    def instance(self, build):
+    def instance(self, build, floor_level: float, floor_scale: float):
         facade = build.cur_facade
-        vec = build.bm.verts.new(self.location)
+        vec = build.bm.verts.new(self.location + Vector((0, 0, floor_level)))
         vec[build.norm_lay] = facade.normal
-        vec[build.scale_lay] = (self.scale.x, self.scale.y, 1)
+        vec[build.scale_lay] = (self.scale.x, self.scale.y * floor_scale, 1)
         vec[build.ind_lay] = self.obj_index
+
+
+class PanelsStack:
+    def __init__(self):
+        self._left_panel = []
+        self._panels = []
+        self._right_panel = []
+        self._stack_width = 0
+
+    def add_panel(self, build, panel_f, p_type: Literal['LEFT', 'FILL', 'RIGHT'] = 'FILL'):
+        build.cur_facade.cur_panel_ind = len(self._panels) if p_type == 'FILL' else 0
+        panel: Panel = panel_f(build)
+        if panel is not None:
+            z_scale = build.cur_floor.height / panel.size.y
+            panel.scale *= Vector((z_scale, z_scale))
+            self._stack_width += panel.instance_size.x
+            if p_type == 'FILL':
+                self._panels.append(panel)
+            elif p_type == 'LEFT':
+                self._left_panel.append(panel)
+            elif p_type == 'RIGHT':
+                self._right_panel.append(panel)
+            return panel
+
+    def is_full(self, build):
+        return self._stack_width > build.cur_facade.width
+
+    def update_location_scale(self, build):
+        facade = build.cur_facade
+        xy_scale = build.cur_facade.width / self._stack_width
+        xy_shift = 0
+        for panel in self.all_panels:
+            panel.scale *= Vector((xy_scale, 1))
+            size = panel.instance_size.x
+            xy_shift += size / 2
+            panel.location = facade.start + facade.direction.normalized() * xy_shift
+            xy_shift += size / 2
+
+    @property
+    def all_panels(self) -> Iterable[Panel]:
+        return chain(self._left_panel, self._panels, self._right_panel)
 
 
 class Floor:
     def __init__(self, index=None):
         self.index = index
         self.height = None
-        self.panels: list[Panel] = None
+        self.z_level = None
+        self.z_scale = None
+        self.panels_stack: PanelsStack = PanelsStack()
         self.depth: set[Literal['floor_index']] = set()
 
-    def set_xy_location(self, build):
-        facade = build.cur_facade
-        xy_shift = 0
-        for pan in self.panels:
-            size = pan.instance_size.x
-            xy_shift += size / 2
-            location = facade.start + facade.direction.normalized() * xy_shift
-            pan.location = location
-            xy_shift += size / 2
+    def instance_panels(self, build):
+        for panel in self.panels_stack.all_panels:
+            panel.instance(build, self.z_level, self.z_scale)
+
+
+class FloorsStack:
+    def __init__(self):
+        self._floors = []
+        self._current_height = 0
+        self._last_ind = 0
+
+    def add_floor(self, build, floor_f) -> Floor:
+        floor: Floor = Floor(index=self._last_ind)
+        build.cur_floor = floor
+        floor_f(build)
+        self._floors.append(floor)
+        self._last_ind += 1
+        self._current_height += floor.height
+        return floor
+
+    def repeat_last(self):
+        self._floors.append(self._floors[-1])
+        self._current_height += self._floors[-1].height
+        self._last_ind += 1
+
+    def will_be_last_floor(self, build, floor_f):
+        floor: Floor = Floor(index=self._last_ind)
+        build.cur_floor = floor
+        floor_f(build, precompute=True)
+        return build.cur_facade.height < (self._current_height + floor.height)
+
+    def is_full(self, build):
+        return build.cur_facade.height < self._current_height
+
+    def instance_floors(self, build):
+        z_scale = build.cur_facade.height / self._current_height
+        real_floors_height = 0
+        for floor in self._floors:
+            height = floor.height * z_scale
+            floor.z_level = real_floors_height + height / 2
+            floor.z_scale = z_scale
+            floor.instance_panels(build)
+            real_floors_height += height
 
 
 class Facade:
