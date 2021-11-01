@@ -5,7 +5,7 @@ import traceback
 from collections import namedtuple, defaultdict, deque
 from enum import Enum, auto
 from graphlib import TopologicalSorter
-from itertools import count, chain, cycle
+from itertools import count, chain, cycle, repeat
 from math import isclose
 from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any
 
@@ -27,7 +27,7 @@ class FacadeTreeNames(PropertyGroup):
 class BuildingGenerator(NodeTree):
     bl_idname = 'BuildingGenerator'
     bl_label = "Building Generator"
-    bl_icon = 'NODETREE'
+    bl_icon = 'HOME'
     was_changes = False  # flag to timer
 
     inst_col: bpy.props.PointerProperty(type=bpy.types.Collection, description="Keep all panels to be instanced")
@@ -1076,6 +1076,7 @@ class ObjectProperties(PropertyGroup):
                 self.id_data.modifiers.remove(mod)
             self.error = ''
         else:
+            self.facade_style.show_in_areas(True)
             self.update_mapping()
             try:
                 self.facade_style.apply(self.id_data)
@@ -1121,7 +1122,13 @@ class ObjectProperties(PropertyGroup):
         else:
             can_be_updated = self.facade_style and self.realtime
         if can_be_updated:
-            self.facade_style.apply(self.id_data)
+            try:
+                self.facade_style.apply(self.id_data)
+            except Exception as e:
+                self.error = str(e)
+                traceback.print_exc()
+            else:
+                self.error = ''
 
     def get_modifier(self) -> Optional[bpy.types.Modifier]:
         obj = self.id_data
@@ -1374,10 +1381,7 @@ class EditPanelAttributesOperator(Operator):
         for fac_obj in (o for o in bpy.data.objects if o.building_props.facade_style):
             props: ObjectProperties = fac_obj.building_props
             if obj in {panel for panel in props.facade_style.inst_col.objects}:
-                try:
-                    props.apply_style()
-                except Exception:
-                    traceback.print_exc()
+                props.apply_style()
         return {'FINISHED'}
 
 
@@ -1520,27 +1524,23 @@ class FloorsStack:
 
 class Facade:
     def __init__(self, face):
-        center = face.calc_center_median()
-        dot_prod = [((v.co - center).cross(face.normal)) @ Vector((0, 0, 1)) for v in face.verts]
-        right_low, right_up = sorted([v for v, prod in zip(face.verts, dot_prod) if prod < 0], key=lambda v: v.co.z)
-        left_low, left_up = sorted([v for v, prod in zip(face.verts, dot_prod) if prod > 0], key=lambda v: v.co.z)
-        left_edge, *_ = [e for e in left_low.link_edges if e.other_vert(left_up) == left_low]
-        right_edge, *_ = [e for e in right_low.link_edges if e.other_vert(right_up) == right_low]
-        xy_dir = (right_up.co - left_low.co) * Vector((1, 1, 0))
+        left_loop, right_loop = Geometry.get_bounding_loops(face)
+        z_len = ((right_loop.vert.co - left_loop.vert.co) * Vector((0, 0, 1))).length
+        xy_dir = (right_loop.vert.co - left_loop.vert.co) * Vector((1, 1, 0))
         xy_len = xy_dir.length
-        z_dir = (left_low.co - right_up.co) * Vector((0, 0, 1))
-        z_len = z_dir.length
 
         self.cur_floor_ind = None
         self.cur_panel_ind = None
+        self.floors_stack: FloorsStack = FloorsStack()
+
         self.height = z_len
         self.width = xy_len
-        self.start = left_low.co
+        self.start = left_loop.vert.co
         self.direction = xy_dir
         self.normal = face.normal
 
-        self.left_wall_angle = left_edge.calc_face_angle()
-        self.right_wall_angle = right_edge.calc_face_angle()
+        self.left_wall_angle = left_loop.link_loop_prev.edge.calc_face_angle(3.14)
+        self.right_wall_angle = right_loop.link_loop_prev.edge.calc_face_angle(3.14)
         self.azimuth = Building.calc_azimuth(self.normal)
 
 
@@ -1563,7 +1563,7 @@ class Building:
 
 
 class Geometry:
-    def __init__(self, verts: list):
+    def __init__(self, verts: list = None):
         self.verts = verts
 
     def get_bounding_verts(self) -> tuple[Vector, Vector]:  # min, max
@@ -1576,6 +1576,111 @@ class Geometry:
     def get_bounding_center(self) -> Vector:
         min_v, max_v = self.get_bounding_verts()
         return (max_v - min_v) * 0.5 + min_v
+
+    @staticmethod
+    def left_right_loops(face: BMFace) -> tuple[Optional[BMLoop], Optional[BMLoop]]:
+        """
+                Z → ↑   left→ o←-------o  Only 4 vertices are expected
+        direction   │   loop  │        ↑
+                    │         │        │
+                    │         ↓        │  right
+                    │         o-------→o ←loop
+        """
+        if len(face.verts) != 4:
+            return None, None
+        for loop in face.loops:
+            loop_dir = (loop.link_loop_next.vert.co - loop.vert.co).normalized()
+            z_angle = Vector((0, 0, 1)).dot(loop_dir)
+            is_right = isclose(1, z_angle, abs_tol=0.3)  # 45 degrees
+            is_left = isclose(-1, z_angle, abs_tol=0.3)
+            if is_left or is_right:
+                break
+        if is_left:
+            return loop, loop.link_loop_next.link_loop_next
+        elif is_right:
+            return loop.link_loop_next.link_loop_next, loop
+        return None, None
+
+    @staticmethod
+    def get_bounding_loops(face: BMFace) -> tuple[Optional[BMLoop], Optional[BMLoop]]:
+        """
+                                    right bounding loop
+                                            ↓
+                Z → ↑         o←------------o  Any number of vertices are expected
+        direction   │         │             ↑  but the shape should be close to quad
+                    │         ↓             │
+                    │         o             o
+                    │         │             ↑
+                    │         ↓             │
+                    │         o-----→o-----→o
+                              ↑
+                    left bounding loop
+        """
+        left_l, right_l = None, None
+        for loop in face.loops:  # https://developer.blender.org/T92620
+            loop_dir = (loop.link_loop_next.vert.co - loop.vert.co).normalized()
+            z_angle = Vector((0, 0, 1)).dot(loop_dir)
+            is_z_up = isclose(1, z_angle, abs_tol=0.3)  # 45 degrees
+            if is_z_up:
+                next_loop = loop.link_loop_next
+                next_loop_dir = (next_loop.link_loop_next.vert.co - next_loop.vert.co).normalized()
+                next_z_angle = Vector((0, 0, 1)).dot(next_loop_dir)
+                is_next_z_up = isclose(1, next_z_angle, abs_tol=0.3)
+                if not is_next_z_up:
+                    right_l = next_loop
+
+            elif is_z_down := isclose(-1, z_angle, abs_tol=0.3):
+                next_loop = loop.link_loop_next
+                next_loop_dir = (next_loop.link_loop_next.vert.co - next_loop.vert.co).normalized()
+                next_z_angle = Vector((0, 0, 1)).dot(next_loop_dir)
+                is_next_z_down = isclose(-1, next_z_angle, abs_tol=0.3)
+                if not is_next_z_down:
+                    left_l = next_loop
+
+            if left_l and right_l:
+                break
+
+        return left_l, right_l
+
+    @staticmethod
+    def get_bounding_vertices(face: BMFace) -> tuple[Optional[BMVert], Optional[BMVert]]:
+        """Works the same as 'get_bounding_loops' but with vertices. Expects the face aligned along Z axis
+        Vertices has the same order as loops"""
+        left_v, right_v = None, None
+        for last_vert, vert, next_vert in zip(
+                chain([face.verts[-1]], face.verts[:-1]), face.verts, chain(face.verts[1:]), [face.verts[0]]):
+            direction = (vert.co - last_vert.co).normalized()
+            z_angle = Vector((0, 0, 1)).dot(direction)
+            is_z_up = isclose(1, z_angle, abs_tol=0.3)  # 45 degrees
+            if is_z_up:
+                next_vert_dir = (next_vert.co - vert.co).normalized()
+                next_z_angle = Vector((0, 0, 1)).dot(next_vert_dir)
+                is_next_z_up = isclose(1, next_z_angle, abs_tol=0.3)
+                if not is_next_z_up:
+                    right_v = next_vert
+
+            elif is_z_down := isclose(-1, z_angle, abs_tol=0.3):
+                next_vert_dir = (next_vert.co - vert.co).normalized()
+                next_z_angle = Vector((0, 0, 1)).dot(next_vert_dir)
+                is_next_z_down = isclose(-1, next_z_angle, abs_tol=0.3)
+                if not is_next_z_down:
+                    left_v = next_vert
+
+            if left_v and right_v:
+                break
+
+        return left_v, right_v
+
+    @staticmethod
+    def mesh_loop_walk(direction_loop: BMLoop) -> Iterable[BMLoop]:
+        prev_loop = direction_loop
+        while (opos_loop := prev_loop.link_loop_radial_next) != prev_loop:
+            next_direction_loop = opos_loop.link_loop_next.link_loop_next
+            if len(next_direction_loop.face.verts) != 4:
+                break
+            yield next_direction_loop
+            prev_loop = next_direction_loop
+
 
 def update_tree_timer():
     if BuildingGenerator.was_changes:
@@ -1617,18 +1722,14 @@ def update_active_object(scene):
     if obj is None:
         return
     obj_props: ObjectProperties = obj.building_props
-    can_be_updated = obj_props.facade_style is not None and obj_props.realtime
-    if not can_be_updated:
-        return
 
     if obj.mode == 'EDIT':
         obj['was_in_edit'] = True
-        if obj_props.show_in_edit_mode:
-            obj_props.facade_style.apply(obj)
+        obj_props.apply_style()
     else:
         if 'was_in_edit' in obj:
             del obj['was_in_edit']
-            obj_props.facade_style.apply(obj)
+            obj_props.apply_style()
 
 
 def get_node_categories():
