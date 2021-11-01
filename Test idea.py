@@ -440,7 +440,7 @@ class FacadeInstanceNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs: Inputs, base_bm: bmesh.types.BMesh, obj_facade_names: list[str]):
-        build = Building()
+        build = Building(min(v.co.z for v in base_bm.verts))
         input_ind = {'': 0}
         for i, obj_f_name in enumerate(obj_facade_names, start=1):
             if obj_f_name != '':
@@ -460,6 +460,27 @@ class FacadeInstanceNode(BaseNode, Node):
                 facade_func(build)
             else:
                 face[wall_lay] = 0
+
+        # testing
+        ind_lay = base_bm.faces.layers.int.get('Facade index') or base_bm.faces.layers.int.new('Facade index')
+        loop_layer = base_bm.loops.layers.int
+        bound_lay = (lay := loop_layer.get('Is bound')) and loop_layer.remove(lay) or loop_layer.new('Is bound')
+        facade_ind = count(1)
+        visited = set()
+        for face in base_bm.faces:
+            if face in visited:
+                continue
+            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
+            is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
+            if is_valid:
+                next_fac_ind = next(facade_ind)
+                for face_bound_loops in build.get_floor_polygons(face):
+                    face = face_bound_loops[0].face
+                    visited.add(face)
+                    face[ind_lay] = next_fac_ind
+                    face_bound_loops[0][bound_lay] = 1
+                    face_bound_loops[1][bound_lay] = 2
+
         return build.bm
 
 
@@ -1522,6 +1543,46 @@ class FloorsStack:
             real_floors_height += height
 
 
+class FacadeFace:
+    def __init__(self, left_loop, right_loop, pos: set[Literal['LEFT', 'RIGHT', 'TOP']], template_floors=None):
+        self.size: Vector = right_loop.vert.co - left_loop.vert.co
+        self.start: Vector = left_loop.vert.co
+        self.direction: Vector = (self.size * Vector((1, 1, 0))).normalized
+        self.normal = left_loop.face.normal
+        self.floors_stack: FloorsStack = FloorsStack()
+        self.position = pos
+        self.template_floors = template_floors
+
+        self.azimuth = None
+
+
+class FacadeFacesStack:
+    def __init__(self):
+        self._corner_loops_stack: list[tuple[BMLoop, BMLoop]] = []
+        self._size: Vector = None
+
+    @property
+    def size(self):
+        if self._size is None:
+            xy_size = sum(((lr.vect.co - ll.vect.co) * Vector((1, 1, 0))).length for ll, lr in self._corner_loops_stack)
+            first_ll, first_lr = self._corner_loops_stack[0]
+            z_size = (first_lr - first_ll).z
+            size = Vector((xy_size, z_size))
+            self._size = size
+        return self._size
+
+    def facade_face_inter(self) -> Iterable[FacadeFace]:
+        positions = chain(['LEFT'], repeat(None, len(self._corner_loops_stack) - 2), ['RIGHT'])
+        prev_face = None
+        for (left_loop, right_loop), pos in zip(self._corner_loops_stack, positions):
+            pos = {pos} if pos else set()
+            if not isclose(right_loop.link_loop_next.edge.calc_face_angle(3.14), 0, abs_tol=0.17):  # 10 degrees
+                pos.add('TOP')
+            facade_face = FacadeFace(left_loop, right_loop, pos, prev_face)
+            yield facade_face
+            prev_face = facade_face
+
+
 class Facade:
     def __init__(self, face):
         left_loop, right_loop = Geometry.get_bounding_loops(face)
@@ -1545,7 +1606,7 @@ class Facade:
 
 
 class Building:
-    def __init__(self):
+    def __init__(self, start_level: float):
         bm = bmesh.new()
         self.norm_lay = bm.verts.layers.float_vector.new("Normal")
         self.scale_lay = bm.verts.layers.float_vector.new("Scale")
@@ -1553,6 +1614,7 @@ class Building:
         self.bm: bmesh.types.BMesh = bm
         self.cur_facade: Facade = None
         self.cur_floor: Floor = None
+        self.start_level: float = start_level
 
     @staticmethod
     def calc_azimuth(vec: Vector):
@@ -1560,6 +1622,38 @@ class Building:
         north = Vector((0, 1, 0))
         is_right = vec.cross(north).normalized().z < 0
         return vec @ north + 3 if is_right else 1 - vec @ north
+
+    @staticmethod
+    def get_floor_polygons(base_face) -> deque[tuple[BMLoop, BMLoop]]:
+        visited: set[BMFace] = {base_face}  # protection from infinite mesh loop
+        mesh_loop: deque[tuple[BMLoop, BMLoop]] = deque()
+        left_loop, right_loop = Geometry.left_right_loops(base_face)
+        if len(base_face.verts) == 4:
+            mesh_loop.append((left_loop.link_loop_next, left_loop.link_loop_prev))
+        else:
+            mesh_loop.append(Geometry.get_bounding_loops(base_face))
+        # if faces are coplanar the angle is zero, with signed version the angle has `-` if angle is inside
+        if left_loop and isclose(left_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):  # 10 degrees
+            for next_left_loop in Geometry.mesh_loop_walk(left_loop):
+                face = next_left_loop.face
+                if face not in visited:
+                    visited.add(face)
+                else:
+                    break
+                mesh_loop.appendleft((next_left_loop.link_loop_next, next_left_loop.link_loop_prev))
+                if not isclose(next_left_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
+                    break
+        if right_loop and isclose(right_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
+            for next_right_loop in Geometry.mesh_loop_walk(right_loop):
+                face = next_right_loop.face
+                if face not in visited:
+                    visited.add(face)
+                else:
+                    break
+                mesh_loop.append((next_right_loop.link_loop_prev, next_right_loop.link_loop_next))
+                if not isclose(next_right_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
+                    break
+        return mesh_loop
 
 
 class Geometry:
