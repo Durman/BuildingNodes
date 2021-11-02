@@ -449,37 +449,20 @@ class FacadeInstanceNode(BaseNode, Node):
         f_lay = base_bm.faces.layers.string.get('Facade name') or base_bm.faces.layers.string.new('Facade name')
         wall_lay = base_bm.faces.layers.int.get("Is wall") or base_bm.faces.layers.int.new("Is wall")
 
-        for face in base_bm.faces:
-            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
-            is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
-            facade_name = face[f_lay].decode()
-            facade_func = inputs[ind] if (ind := input_ind.get(facade_name, 0)) < len(inputs) else inputs[0]
-            if is_valid and facade_func:
-                face[wall_lay] = 1
-                build.cur_facade = Facade(face)
-                facade_func(build)
-            else:
-                face[wall_lay] = 0
-
-        # testing
-        ind_lay = base_bm.faces.layers.int.get('Facade index') or base_bm.faces.layers.int.new('Facade index')
-        loop_layer = base_bm.loops.layers.int
-        bound_lay = (lay := loop_layer.get('Is bound')) and loop_layer.remove(lay) or loop_layer.new('Is bound')
-        facade_ind = count(1)
         visited = set()
         for face in base_bm.faces:
             if face in visited:
                 continue
             is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
             is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
-            if is_valid:
-                next_fac_ind = next(facade_ind)
-                for face_bound_loops in build.get_floor_polygons(face):
-                    face = face_bound_loops[0].face
-                    visited.add(face)
-                    face[ind_lay] = next_fac_ind
-                    face_bound_loops[0][bound_lay] = 1
-                    face_bound_loops[1][bound_lay] = 2
+            facade_name = face[f_lay].decode()
+            facade_func = inputs[ind] if (ind := input_ind.get(facade_name, 0)) < len(inputs) else inputs[0]
+            if is_valid and facade_func:
+                face[wall_lay] = 1
+                build.cur_facade = Facade(build.get_floor_polygons(face))
+                facade_func(build)
+            else:
+                face[wall_lay] = 0
 
         return build.bm
 
@@ -694,12 +677,16 @@ class FloorPatternNode(BaseNode, Node):
             if inputs.right:
                 pan_stack.add_panel(build, inputs.right, 'RIGHT')
             if not pan_stack.is_full(build):
-                for i in range(10000):
-                    pan_stack.add_panel(build, inputs.fill)
-                    if pan_stack.is_full(build):
+                for i in range(1000):
+                    panel = pan_stack.add_panel(build, inputs.fill)
+                    if panel is None or pan_stack.is_full(build):
                         break
 
-            pan_stack.update_location_scale(build)
+            if pan_stack.has_panels:
+                pan_stack.update_location_scale(build)
+                return True
+            else:
+                return False
         return floor_gen
 
 
@@ -797,49 +784,53 @@ class FacadePatternNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         def facade_generator(build: Building):
-            floors_stack = build.cur_facade.floors_stack
-            is_fill_fixed = False
-            if inputs.first:
-                floors_stack.add_floor(build, inputs.first)
-            if inputs.fill:
-                for i in range(10000):
-                    if inputs.last:
-                        if floors_stack.will_be_last_floor(build, inputs.last):
-                            floors_stack.add_floor(build, inputs.last)
-                            break
-                    else:
-                        if floors_stack.is_full(build):
-                            break
+            for facade_face in build.cur_facade.facade_faces_stack.facade_face_inter(build):
+                floors_stack = facade_face.floors_stack
 
-                    if not is_fill_fixed:
-                        floor = floors_stack.add_floor(build, inputs.fill)
-                        if 'floor_index' not in floor.depth:
-                            is_fill_fixed = True
-                    else:
-                        floors_stack.repeat_last()
-            floors_stack.instance_floors(build)
+                # searching first floor index
+                if floors_stack.first_index is None:
+                    is_fill_fixed = False
+                    floors_stack.first_index = 0
+                    start_height = facade_face.start.z - build.start_level
+                    if not isclose(start_height, 0, abs_tol=0.1):
+                        if inputs.first:
+                            floors_stack.add_floor(build, inputs.first, mockup=True)
+                        if inputs.fill:
+                            for i in range(10000):
+                                if floors_stack.is_full(start_height):
+                                    break
+                                if not is_fill_fixed:
+                                    floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
+                                    if 'floor_index' not in floor.depth:
+                                        is_fill_fixed = True
+                                else:
+                                    floors_stack.repeat_last()
+                        start_index = len(floors_stack.floors)
+                        floors_stack.clear(start_index)
+
+                # generate floors
+                is_fill_fixed = False
+                if inputs.first and floors_stack.first_index == 0:
+                    floors_stack.add_floor(build, inputs.first)
+                if inputs.fill:
+                    for i in range(10000):
+                        if inputs.last and 'TOP' in build.cur_facade_face.position:
+                            if floors_stack.will_be_last_floor(build, inputs.last, build.cur_facade.size.y):
+                                floors_stack.add_floor(build, inputs.last)
+                                break
+                        else:
+                            if floors_stack.is_full(build.cur_facade.size.y):
+                                break
+
+                        if not is_fill_fixed:
+                            floor = floors_stack.add_floor(build, inputs.fill)
+                            if 'floor_index' not in floor.depth:
+                                is_fill_fixed = True
+                        else:
+                            floors_stack.repeat_last()
+                floors_stack.instance_floors(build)
             return True
 
-        return facade_generator
-
-    @staticmethod
-    def _execute(inputs: Inputs, params):
-        def facade_generator(build: Building):
-            facade = build.cur_facade
-            facade.cur_floor_ind = 0
-            vertices, flor_height = inputs.fill(build)
-            flor_num = max(int(round(facade.height / flor_height)), 1)
-            z_scale = facade.height / (flor_num * flor_height)
-            z_step = Vector((0, 0, 1)) * (z_scale * flor_height)
-            for v in vertices:
-                v.co += z_step * 0.5
-                v[build.scale_lay] *= Vector((1, z_scale, 1))
-            for fi in range(1, flor_num):
-                facade.cur_floor_ind = fi
-                vertices, flor_height = inputs.fill(build)
-                for v in vertices:
-                    v.co += z_step * 0.5 + z_step * fi
-                    v[build.scale_lay] *= Vector((1, z_scale, 1))
         return facade_generator
 
 
@@ -1212,8 +1203,10 @@ class AddNewFacadeStyleOperator(Operator):
         node2.location = Vector((200, 0))
         node3.location = Vector((400, 0))
         node4.location = Vector((600, 0))
-        obj_props.facade_style = tree
-        tree.show_in_areas(True)
+        try:
+            obj_props.facade_style = tree
+        finally:
+            tree.show_in_areas(True)
         return {'FINISHED'}
 
 
@@ -1441,9 +1434,9 @@ class Panel:
         self.size.y += padding[1] + padding[3]
 
     def instance(self, build, floor_level: float, floor_scale: float):
-        facade = build.cur_facade
+        facade_face = build.cur_facade_face
         vec = build.bm.verts.new(self.location + Vector((0, 0, floor_level)))
-        vec[build.norm_lay] = facade.normal
+        vec[build.norm_lay] = facade_face.normal
         vec[build.scale_lay] = (self.scale.x, self.scale.y * floor_scale, 1)
         vec[build.ind_lay] = self.obj_index
 
@@ -1471,18 +1464,22 @@ class PanelsStack:
             return panel
 
     def is_full(self, build):
-        return self._stack_width > build.cur_facade.width
+        return self._stack_width > build.cur_facade_face.size.x
 
     def update_location_scale(self, build):
-        facade = build.cur_facade
-        xy_scale = build.cur_facade.width / self._stack_width
+        facade_face = build.cur_facade_face
+        xy_scale = build.cur_facade_face.size.x / self._stack_width
         xy_shift = 0
         for panel in self.all_panels:
             panel.scale *= Vector((xy_scale, 1))
             size = panel.instance_size.x
             xy_shift += size / 2
-            panel.location = facade.start + facade.direction.normalized() * xy_shift
+            panel.location = facade_face.start + facade_face.direction * xy_shift
             xy_shift += size / 2
+
+    @property
+    def has_panels(self) -> bool:
+        return any([self._left_panel, self._panels, self._right_panel])
 
     @property
     def all_panels(self) -> Iterable[Panel]:
@@ -1504,38 +1501,51 @@ class Floor:
 
 
 class FloorsStack:
-    def __init__(self):
-        self._floors = []
+    def __init__(self, first_index=None):
+        self.floors = []
         self._current_height = 0
-        self._last_ind = 0
+        self._last_ind = first_index
 
-    def add_floor(self, build, floor_f) -> Floor:
+    def clear(self, new_first_index=None):
+        self.floors.clear()
+        self._current_height = 0
+        self._last_ind = new_first_index
+
+    @property
+    def first_index(self):
+        return self._last_ind
+
+    @first_index.setter
+    def first_index(self, value):
+        self._last_ind = value
+
+    def add_floor(self, build, floor_f, mockup=False) -> Floor:
         floor: Floor = Floor(index=self._last_ind)
         build.cur_floor = floor
-        floor_f(build)
-        self._floors.append(floor)
+        floor_f(build, precompute=mockup)
+        self.floors.append(floor)
         self._last_ind += 1
         self._current_height += floor.height
         return floor
 
     def repeat_last(self):
-        self._floors.append(self._floors[-1])
-        self._current_height += self._floors[-1].height
+        self.floors.append(self.floors[-1])
+        self._current_height += self.floors[-1].height
         self._last_ind += 1
 
-    def will_be_last_floor(self, build, floor_f):
+    def will_be_last_floor(self, build, floor_f, height):
         floor: Floor = Floor(index=self._last_ind)
         build.cur_floor = floor
         floor_f(build, precompute=True)
-        return build.cur_facade.height < (self._current_height + floor.height)
+        return height < (self._current_height + floor.height)
 
-    def is_full(self, build):
-        return build.cur_facade.height < self._current_height
+    def is_full(self, height: float):
+        return height < self._current_height
 
     def instance_floors(self, build):
-        z_scale = build.cur_facade.height / self._current_height
+        z_scale = build.cur_facade_face.size.y / self._current_height
         real_floors_height = 0
-        for floor in self._floors:
+        for floor in self.floors:
             height = floor.height * z_scale
             floor.z_level = real_floors_height + height / 2
             floor.z_scale = z_scale
@@ -1544,65 +1554,61 @@ class FloorsStack:
 
 
 class FacadeFace:
-    def __init__(self, left_loop, right_loop, pos: set[Literal['LEFT', 'RIGHT', 'TOP']], template_floors=None):
-        self.size: Vector = right_loop.vert.co - left_loop.vert.co
+    def __init__(self, left_loop, right_loop, pos: set[Literal['LEFT', 'RIGHT', 'TOP']], template: 'FacadeFace' = None):
+        dist_vec = right_loop.vert.co - left_loop.vert.co
+        xy_size = (dist_vec * Vector((1, 1, 0))).length
+
+        self.size: Vector = Vector((xy_size, dist_vec.z))
         self.start: Vector = left_loop.vert.co
-        self.direction: Vector = (self.size * Vector((1, 1, 0))).normalized
+        self.direction: Vector = (dist_vec * Vector((1, 1, 0))).normalized()
         self.normal = left_loop.face.normal
-        self.floors_stack: FloorsStack = FloorsStack()
+        self.floors_stack: FloorsStack = FloorsStack(template and template.floors_stack.floors[0].index)
         self.position = pos
-        self.template_floors = template_floors
+        self.template_floors = template
 
         self.azimuth = None
 
 
 class FacadeFacesStack:
-    def __init__(self):
-        self._corner_loops_stack: list[tuple[BMLoop, BMLoop]] = []
+    def __init__(self, face_loops: list[tuple[BMLoop, BMLoop]]):
+        self._corner_loops_stack: list[tuple[BMLoop, BMLoop]] = face_loops
         self._size: Vector = None
 
     @property
-    def size(self):
+    def size(self) -> Vector:
         if self._size is None:
-            xy_size = sum(((lr.vect.co - ll.vect.co) * Vector((1, 1, 0))).length for ll, lr in self._corner_loops_stack)
+            xy_size = sum(((lr.vert.co - ll.vert.co) * Vector((1, 1, 0))).length for ll, lr in self._corner_loops_stack)
             first_ll, first_lr = self._corner_loops_stack[0]
-            z_size = (first_lr - first_ll).z
+            z_size = (first_lr.vert.co - first_ll.vert.co).z
             size = Vector((xy_size, z_size))
             self._size = size
         return self._size
 
-    def facade_face_inter(self) -> Iterable[FacadeFace]:
+    def facade_face_inter(self, build) -> Iterable[FacadeFace]:
         positions = chain(['LEFT'], repeat(None, len(self._corner_loops_stack) - 2), ['RIGHT'])
         prev_face = None
         for (left_loop, right_loop), pos in zip(self._corner_loops_stack, positions):
             pos = {pos} if pos else set()
-            if not isclose(right_loop.link_loop_next.edge.calc_face_angle(3.14), 0, abs_tol=0.17):  # 10 degrees
+            if right_loop.edge.calc_face_angle(3.14) > 0.17:  # 10 degrees
                 pos.add('TOP')
             facade_face = FacadeFace(left_loop, right_loop, pos, prev_face)
+            build.cur_facade_face = facade_face
             yield facade_face
             prev_face = facade_face
 
 
 class Facade:
-    def __init__(self, face):
-        left_loop, right_loop = Geometry.get_bounding_loops(face)
-        z_len = ((right_loop.vert.co - left_loop.vert.co) * Vector((0, 0, 1))).length
-        xy_dir = (right_loop.vert.co - left_loop.vert.co) * Vector((1, 1, 0))
-        xy_len = xy_dir.length
-
+    def __init__(self, face_loops: list[tuple[BMLoop, BMLoop]]):
         self.cur_floor_ind = None
         self.cur_panel_ind = None
-        self.floors_stack: FloorsStack = FloorsStack()
+        self.facade_faces_stack: FacadeFacesStack = FacadeFacesStack(face_loops)
 
-        self.height = z_len
-        self.width = xy_len
-        self.start = left_loop.vert.co
-        self.direction = xy_dir
-        self.normal = face.normal
+        self.left_wall_angle = face_loops[0][0].link_loop_prev.edge.calc_face_angle(3.14)
+        self.right_wall_angle = face_loops[-1][1].link_loop_prev.edge.calc_face_angle(3.14)
 
-        self.left_wall_angle = left_loop.link_loop_prev.edge.calc_face_angle(3.14)
-        self.right_wall_angle = right_loop.link_loop_prev.edge.calc_face_angle(3.14)
-        self.azimuth = Building.calc_azimuth(self.normal)
+    @property
+    def size(self) -> Vector:
+        return self.facade_faces_stack.size
 
 
 class Building:
@@ -1612,9 +1618,11 @@ class Building:
         self.scale_lay = bm.verts.layers.float_vector.new("Scale")
         self.ind_lay = bm.verts.layers.int.new("Wall index")
         self.bm: bmesh.types.BMesh = bm
-        self.cur_facade: Facade = None
-        self.cur_floor: Floor = None
         self.start_level: float = start_level
+
+        self.cur_facade: Facade = None
+        self.cur_facade_face: FacadeFace = None
+        self.cur_floor: Floor = None
 
     @staticmethod
     def calc_azimuth(vec: Vector):
