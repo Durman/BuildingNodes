@@ -177,7 +177,9 @@ class BuildingStyleTree(NodeTree):
                     sock_names.user_name = socket.user_name or socket.default_name
 
     def update_sockets(self):
-        """Supports only adding sockets to the end of input output collections"""
+        """ Supports:
+        - adding sockets to the end of input output collections
+        """
         for node in self.nodes:
             for sock, template in zip(chain(node.inputs, [None]), node.input_template):
                 if sock is None:
@@ -348,7 +350,7 @@ class SocketTemplate(NamedTuple):
     name: str = ''
     enabled: bool = True
     display_shape: Literal['CIRCLE', 'SQUARE', 'DIAMOND', 'CIRCLE_DOT', 'SQUARE_DOT', 'DIAMOND_DOT'] = None
-    value: Any = None
+    default_value: Any = None
 
     def init(self, node: Node, is_input):
         node_sockets = node.inputs if is_input else node.outputs
@@ -357,8 +359,8 @@ class SocketTemplate(NamedTuple):
             sock.enabled = False
         if self.display_shape:
             sock.display_shape = self.display_shape
-        if self.value is not None:
-            sock.value = self.value
+        if self.default_value is not None:
+            sock.value = self.default_value
 
 
 class BaseNode:
@@ -462,8 +464,13 @@ class FacadeInstanceNode(BaseNode, Node):
             facade_name = face[f_lay].decode()
             facade_func = inputs[ind] if (ind := input_ind.get(facade_name, 0)) < len(inputs) else inputs[0]
             if is_valid and facade_func:
-                face[wall_lay] = 1
-                build.cur_facade = Facade(build.get_floor_polygons(face))
+
+                face_loops = build.get_floor_polygons(face)
+                for loop, _ in face_loops:
+                    loop.face[wall_lay] = 1
+                    visited.add(loop.face)
+
+                build.cur_facade = Facade(face_loops)
                 facade_func(build)
             else:
                 face[wall_lay] = 0
@@ -488,12 +495,13 @@ class PanelNode(BaseNode, Node):
     bl_idname = 'bn_PanelNode'
     bl_label = "Panel"
     category = Categories.PANEL
-    Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding'])
+    Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding', 'probability'])
     Props = namedtuple('Props', ['panel_index'])
     input_template = Inputs(
         SocketTemplate(ObjectSocket),
         SocketTemplate(BoolSocket, 'Scalable', enabled=False),
         SocketTemplate(Vector4Socket, 'Scope padding', enabled=False),
+        SocketTemplate(FloatSocket, 'Probability', enabled=False, default_value=1),
     )
     output_template = [SocketTemplate(PanelSocket)]
 
@@ -523,6 +531,7 @@ class PanelNode(BaseNode, Node):
             min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts)))
             max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts)))
             panel = Panel(props.panel_index, max_v - min_v)
+            panel.probability = inputs.probability(build)
             panel.set_scope_padding(inputs.scope_padding(build))  # for now it works only as scale
             return panel
         return panel_gen
@@ -682,7 +691,7 @@ class FloorPatternNode(BaseNode, Node):
                 pan_stack.add_panel(build, inputs.left, 'LEFT')
             if inputs.right:
                 pan_stack.add_panel(build, inputs.right, 'RIGHT')
-            if not pan_stack.is_full(build):
+            if inputs.fill and not pan_stack.is_full(build):
                 for i in range(1000):
                     panel = pan_stack.add_panel(build, inputs.fill)
                     if panel is None or pan_stack.is_full(build):
@@ -1394,10 +1403,10 @@ class EditPanelAttributesOperator(Operator):
             for vert in bm.verts:
                 vert[sc_lay] = vert.select
             points = [v for v in bm.verts if v[sc_lay]] or bm.verts
-            # center = Vector((sum(v.x for v in points) / len(points), sum(v.y for v in points) / len(points),
-            #                  sum(v.z for v in points) / len(points)))
             center = Geometry(points).get_bounding_center()
-            obj.location += center
+            glob_center = center * obj.scale
+            glob_center.rotate(obj.rotation_euler)
+            obj.location += glob_center
             for vert in bm.verts:
                 vert.co -= center
         obj.data.update()
@@ -1449,6 +1458,9 @@ class Panel:
         vec[build.scale_lay] = (self.scale.x, self.scale.y * floor_scale, 1)
         vec[build.ind_lay] = self.obj_index
 
+    def __repr__(self):
+        return f"<Panel o={self.obj_index}, loc=({self.location.x:.2f}, {self.location.y:.2f})>"
+
 
 class PanelsStack:
     def __init__(self):
@@ -1494,6 +1506,9 @@ class PanelsStack:
     def all_panels(self) -> Iterable[Panel]:
         return chain(self._left_panel, self._panels, self._right_panel)
 
+    def __repr__(self):
+        return f"[{self._left_panel or ''}, {', '.join(repr(p) for p in self._panels)}, {self._right_panel or ''}]"
+
 
 class Floor:
     def __init__(self, index=None):
@@ -1507,6 +1522,9 @@ class Floor:
     def instance_panels(self, build):
         for panel in self.panels_stack.all_panels:
             panel.instance(build, self.z_level, self.z_scale)
+
+    def __repr__(self):
+        return f"<Floor i={self.index}, {self.panels_stack}>"
 
 
 class FloorsStack:
@@ -1561,6 +1579,10 @@ class FloorsStack:
             floor.instance_panels(build)
             real_floors_height += height
 
+    def __repr__(self):
+        floors = '\n'.join(repr(f) for f in reversed(self.floors))
+        return f"[{floors}]"
+
 
 class FacadeFace:
     def __init__(self, left_loop, right_loop, pos: set[Literal['LEFT', 'RIGHT', 'TOP']], template: 'FacadeFace' = None):
@@ -1576,6 +1598,9 @@ class FacadeFace:
         self.template_floors = template
 
         self.azimuth = None
+
+    def __repr__(self):
+        return f"<FFace {self.floors_stack}>"
 
 
 class FacadeFacesStack:
