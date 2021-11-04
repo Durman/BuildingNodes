@@ -160,7 +160,7 @@ class BuildingStyleTree(NodeTree):
     def walk(self):
         node_graph = defaultdict(set)
         prev_sock = dict()
-        for link in self.links:
+        for link in (l for l in self.links if not l.is_muted):
             node_graph[link.to_node].add(link.from_node)
             prev_sock[link.to_socket] = link.from_socket
         for node in TopologicalSorter(node_graph).static_order():
@@ -392,12 +392,13 @@ class BaseNode:
 
     def update(self):
         # update sockets
+        links = {l.to_socket: l for l in self.id_data.links}
         if self.repeat_last_socket:
             sock_id_name = self.inputs[-1].bl_idname
             if self.inputs[-1].is_linked:
                 self.inputs.new(sock_id_name, "")
             for socket in list(self.inputs)[-2::-1]:
-                if socket.bl_idname == self.inputs[-1].bl_idname and not socket.is_linked:
+                if socket.bl_idname == self.inputs[-1].bl_idname and socket not in links:
                     self.inputs.remove(socket)
         if self.repeat_first_socket:
             sock_id_name = self.inputs[0].bl_idname
@@ -620,13 +621,12 @@ class PanelRandomizeNode(BaseNode, Node):
         random_streams = dict()
 
         def randomize_panels(build: Building):
-            seed = int(inputs.seed(build))
-            rand_stream = random_streams.get(seed)
-            if rand_stream is None:
-                rand_stream = random.Random(seed)
-                random_streams[seed] = rand_stream
-            panels = [inp(build) for inp in inputs[1: -1]]
-            return rand_stream.choices(panels, weights=[p.probability for p in panels])[0]
+            stream = random_streams.get(build.cur_facade.cur_floor_ind)
+            if stream is None:
+                stream = random.Random(int(inputs.seed(build)))
+                random_streams[build.cur_facade.cur_floor_ind] = stream
+            panels = [inp(build) for inp in inputs[1: -1] if inp is not None]
+            return stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
 
 
@@ -682,11 +682,14 @@ class FloorPatternNode(BaseNode, Node):
     def execute(cls, inputs: Inputs, params):
         def floor_gen(build: Building, precompute=False):
             if precompute:
-                build.cur_floor.height = inputs.height(build)
-                return
+                floor = Floor(build.cur_facade.cur_floor_ind)
+                floor.height = inputs.height(build)
+                return floor
 
-            build.cur_floor.height = inputs.height(build)
-            pan_stack = build.cur_floor.panels_stack
+            floor = Floor(build.cur_facade.cur_floor_ind)
+            build.cur_floor = floor
+            floor.height = inputs.height(build)
+            pan_stack = floor.panels_stack
             if inputs.left:
                 pan_stack.add_panel(build, inputs.left, 'LEFT')
             if inputs.right:
@@ -699,9 +702,9 @@ class FloorPatternNode(BaseNode, Node):
 
             if pan_stack.has_panels:
                 pan_stack.update_location_scale(build)
-                return True
+                return floor
             else:
-                return False
+                return None
         return floor_gen
 
 
@@ -727,8 +730,8 @@ class FloorAttributesNode(BaseNode, Node):
             return None
 
         def floor_index(build: Building):
-            build.cur_floor.depth.add('floor_index')
-            return build.cur_floor.index
+            build.depth.add('floor_index')
+            return build.cur_facade.cur_floor_ind
 
         def left_corner_angle(build: Building):
             return build.cur_facade.left_wall_angle
@@ -755,13 +758,56 @@ class FloorSwitchNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs: Inputs, props):
-        def switch_floor(build, precompute=False):
-            if inputs.bool(build):
-                if inputs.true_floor is not None:
-                    inputs.true_floor(build, precompute=precompute)
+        catch = dict()
+        depth = set()
+        last_facade_face = None
+
+        def switch_floor(build: Building, precompute=False):
+            if precompute:
+                if inputs.bool(build):
+                    if inputs.true_floor is not None:
+                        return inputs.true_floor(build, precompute=precompute)
+                else:
+                    if inputs.false_floor is not None:
+                        return inputs.false_floor(build, precompute=precompute)
+
+            if inputs.bool is None:
+                return
+            nonlocal last_facade_face
+            if build.cur_facade_face != last_facade_face:  # the catch should exist per facade face
+                last_facade_face = build.cur_facade_face
+                catch.clear()
+                depth.clear()
+            switch_state = None
+            if inputs.bool not in catch:
+                build.depth.clear()
+                switch_state = inputs.bool(build)
+                catch[inputs.bool] = None if build.depth else switch_state
+                depth.update(build.depth)
+            return_true = switch_state or catch[inputs.bool] or inputs.bool(build)
+            if return_true:
+                if inputs.true_floor:
+                    true_floor = None
+                    if inputs.true_floor not in catch:
+                        build.depth.clear()
+                        true_floor = inputs.true_floor(build)
+                        catch[inputs.true_floor] = None if build.depth else true_floor
+                        depth.update(build.depth)
+                    build.depth = depth.copy()
+                    floor = true_floor or catch[inputs.true_floor] or inputs.true_floor(build)
+                    return floor
             else:
-                if inputs.false_floor is not None:
-                    inputs.false_floor(build, precompute=precompute)
+                if inputs.false_floor:
+                    false_floor = None
+                    if inputs.false_floor not in catch:
+                        build.depth.clear()
+                        false_floor = inputs.false_floor(build)
+                        catch[inputs.false_floor] = None if build.depth else false_floor
+                        depth.update(build.depth)
+                    build.depth = depth.copy()
+                    floor = false_floor or catch[inputs.false_floor] or inputs.false_floor(build)
+                    return floor
+
         return switch_floor
 
 
@@ -816,8 +862,9 @@ class FacadePatternNode(BaseNode, Node):
                                     break
                                 if not is_fill_fixed:
                                     floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
-                                    if 'floor_index' not in floor.depth:
-                                        is_fill_fixed = True
+                                    if floor is None:
+                                        break
+                                    is_fill_fixed = not build.depth
                                 else:
                                     floors_stack.repeat_last()
                         start_index = len(floors_stack.floors)
@@ -839,11 +886,13 @@ class FacadePatternNode(BaseNode, Node):
 
                         if not is_fill_fixed:
                             floor = floors_stack.add_floor(build, inputs.fill)
-                            if 'floor_index' not in floor.depth:
-                                is_fill_fixed = True
+                            if floor is None:
+                                break
+                            is_fill_fixed = not build.depth
                         else:
                             floors_stack.repeat_last()
-                floors_stack.instance_floors(build)
+                if facade_face:
+                    floors_stack.instance_floors(build)
             return True
 
         return facade_generator
@@ -1133,7 +1182,7 @@ class ObjectProperties(PropertyGroup):
 
     building_style: bpy.props.PointerProperty(
         type=bpy.types.NodeTree, poll=is_building_tree, name="Building Style", update=update_style)
-    points: bpy.props.PointerProperty(type=bpy.types.Object)
+    points: bpy.props.PointerProperty(type=bpy.types.Object)  # todo should be removed in object copies
     error: bpy.props.StringProperty()
     show_in_edit_mode: bpy.props.BoolProperty(
         default=True, description="Show building style in edit mode", update=update_show_in_edit)
@@ -1459,7 +1508,7 @@ class Panel:
         vec[build.ind_lay] = self.obj_index
 
     def __repr__(self):
-        return f"<Panel o={self.obj_index}, loc=({self.location.x:.2f}, {self.location.y:.2f})>"
+        return f"<Panel:{self.obj_index}, loc=({self.location.x:.2f}, {self.location.y:.2f})>"
 
 
 class PanelsStack:
@@ -1507,7 +1556,8 @@ class PanelsStack:
         return chain(self._left_panel, self._panels, self._right_panel)
 
     def __repr__(self):
-        return f"[{self._left_panel or ''}, {', '.join(repr(p) for p in self._panels)}, {self._right_panel or ''}]"
+        str_panels = ', '.join(str(p) for p in chain([self._left_panel], self._panels, [self._right_panel]) if p)
+        return f"[{str_panels}]"
 
 
 class Floor:
@@ -1517,7 +1567,6 @@ class Floor:
         self.z_level = None
         self.z_scale = None
         self.panels_stack: PanelsStack = PanelsStack()
-        self.depth: set[Literal['floor_index']] = set()
 
     def instance_panels(self, build):
         for panel in self.panels_stack.all_panels:
@@ -1546,25 +1595,25 @@ class FloorsStack:
     def first_index(self, value):
         self._last_ind = value
 
-    def add_floor(self, build, floor_f, mockup=False) -> Floor:
-        floor: Floor = Floor(index=self._last_ind)
-        build.cur_floor = floor
-        floor_f(build, precompute=mockup)
-        self.floors.append(floor)
-        self._last_ind += 1
-        self._current_height += floor.height
-        return floor
+    def add_floor(self, build, floor_f, mockup=False) -> Optional[Floor]:
+        build.cur_facade.cur_floor_ind = self._last_ind
+        floor = floor_f(build, precompute=mockup)
+        if floor:
+            self.floors.append(floor)
+            self._last_ind += 1
+            self._current_height += floor.height
+            return floor
 
     def repeat_last(self):
         self.floors.append(self.floors[-1])
         self._current_height += self.floors[-1].height
         self._last_ind += 1
 
-    def will_be_last_floor(self, build, floor_f, height):
-        floor: Floor = Floor(index=self._last_ind)
-        build.cur_floor = floor
-        floor_f(build, precompute=True)
-        return height < (self._current_height + floor.height)
+    def will_be_last_floor(self, build, floor_f, height) -> Optional[bool]:
+        build.cur_facade.cur_floor_ind = self._last_ind
+        floor = floor_f(build, precompute=True)
+        if floor:
+            return height < (self._current_height + floor.height)
 
     def is_full(self, height: float):
         return height < self._current_height
@@ -1601,6 +1650,9 @@ class FacadeFace:
 
     def __repr__(self):
         return f"<FFace {self.floors_stack}>"
+
+    def __bool__(self):
+        return bool(self.floors_stack.floors)
 
 
 class FacadeFacesStack:
@@ -1657,6 +1709,8 @@ class Building:
         self.cur_facade: Facade = None
         self.cur_facade_face: FacadeFace = None
         self.cur_floor: Floor = None
+
+        self.depth: set[Literal['floor_index']] = set()
 
     @staticmethod
     def calc_azimuth(vec: Vector):
