@@ -516,22 +516,27 @@ class PanelNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs: Inputs, props: Props):
+        size_v_catch = None
+
         def panel_gen(build: Building):
             # panel is expected to be in XY orientation
-            obj = inputs.object(build)
-            if obj is None:
-                return None
-            if obj.mode == 'EDIT':
-                bm = bmesh.from_edit_mesh(obj.data)
-                sc_lay = bm.verts.layers.int.get('Is scope')
-                verts = [v for v in bm.verts if v[sc_lay]] if sc_lay else list(bm.verts)
-            else:
-                attr = obj.data.attributes.get('Is scope')
-                verts = [v for v, a in zip(obj.data.vertices, attr.data.values()) if a.value]\
-                    if attr else obj.data.vertices
-            min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts)))
-            max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts)))
-            panel = Panel(props.panel_index, max_v - min_v)
+            nonlocal size_v_catch
+            if size_v_catch is None:
+                obj = inputs.object(build)
+                if obj is None:
+                    return None
+                if obj.mode == 'EDIT':
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    sc_lay = bm.verts.layers.int.get('Is scope')
+                    verts = [v for v in bm.verts if v[sc_lay]] if sc_lay else list(bm.verts)
+                else:
+                    attr = obj.data.attributes.get('Is scope')
+                    verts = [v for v, a in zip(obj.data.vertices, attr.data.values()) if a.value]\
+                        if attr else obj.data.vertices
+                min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts)))
+                max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts)))
+                size_v_catch = max_v - min_v
+            panel = Panel(props.panel_index, size_v_catch)
             panel.probability = inputs.probability(build)
             panel.set_scope_padding(inputs.scope_padding(build))  # for now it works only as scale
             return panel
@@ -724,7 +729,7 @@ class FloorAttributesNode(BaseNode, Node):
     @staticmethod
     def execute(inputs, props):
         def floor_width(build: Building):
-            return build.cur_facade.width
+            return build.cur_facade.size.x
 
         def floor_height(build: Building):
             return None
@@ -861,7 +866,11 @@ class FacadePatternNode(BaseNode, Node):
                                 if floors_stack.is_full(start_height):
                                     break
                                 if not is_fill_fixed:
-                                    floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
+                                    floor = None
+                                    for _ in range(10):
+                                        floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
+                                        if floor:
+                                            break
                                     if floor is None:
                                         break
                                     is_fill_fixed = not build.depth
@@ -885,7 +894,11 @@ class FacadePatternNode(BaseNode, Node):
                                 break
 
                         if not is_fill_fixed:
-                            floor = floors_stack.add_floor(build, inputs.fill)
+                            floor = None
+                            for _ in range(10):
+                                floor = floors_stack.add_floor(build, inputs.fill)
+                                if floor:
+                                    break
                             if floor is None:
                                 break
                             is_fill_fixed = not build.depth
@@ -1578,7 +1591,7 @@ class Floor:
 
 class FloorsStack:
     def __init__(self, first_index=None):
-        self.floors = []
+        self.floors: list[Optional[Floor]] = []
         self._current_height = 0
         self._last_ind = first_index
 
@@ -1598,22 +1611,20 @@ class FloorsStack:
     def add_floor(self, build, floor_f, mockup=False) -> Optional[Floor]:
         build.cur_facade.cur_floor_ind = self._last_ind
         floor = floor_f(build, precompute=mockup)
-        if floor:
-            self.floors.append(floor)
-            self._last_ind += 1
-            self._current_height += floor.height
-            return floor
+        self.floors.append(floor)
+        self._last_ind += 1
+        self._current_height += floor.height if floor else 0
+        return floor
 
     def repeat_last(self):
         self.floors.append(self.floors[-1])
-        self._current_height += self.floors[-1].height
+        self._current_height += last_floor.height if (last_floor := self.floors[-1]) else 0
         self._last_ind += 1
 
     def will_be_last_floor(self, build, floor_f, height) -> Optional[bool]:
         build.cur_facade.cur_floor_ind = self._last_ind
         floor = floor_f(build, precompute=True)
-        if floor:
-            return height < (self._current_height + floor.height)
+        return height < (self._current_height + (floor and floor.height or 0))
 
     def is_full(self, height: float):
         return height < self._current_height
@@ -1622,6 +1633,8 @@ class FloorsStack:
         z_scale = build.cur_facade_face.size.y / self._current_height
         real_floors_height = 0
         for floor in self.floors:
+            if not floor:
+                continue
             height = floor.height * z_scale
             floor.z_level = real_floors_height + height / 2
             floor.z_scale = z_scale
@@ -1899,7 +1912,7 @@ def update_active_object(scene):
 
     # change active object event, update tree property of Building tree editors
     try:  # todo also changes of the tree editor type should tracked
-        if (prev_obj := scene['active_obj']) != obj:
+        if (prev_obj := scene['active_obj']) != obj:  # todo handle removing objects
             scene['active_obj'] = obj
             if cur_tree := obj.building_props.building_style:
                 cur_tree.show_in_areas(True)
