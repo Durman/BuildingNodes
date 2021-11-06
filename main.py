@@ -13,7 +13,7 @@ import bmesh
 import bpy
 from bmesh.types import BMEdge, BMFace, BMLoop, BMVert
 from bpy.app.handlers import persistent
-from bpy.props import StringProperty
+from bpy.props import StringProperty, BoolProperty
 from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
 import nodeitems_utils
 from mathutils import Vector
@@ -160,7 +160,7 @@ class BuildingStyleTree(NodeTree):
 
         return self.inst_col
 
-    def walk(self):
+    def walk(self):  # todo support reroutes
         node_graph = defaultdict(set)
         prev_sock = dict()
         for link in (l for l in self.links if not l.is_muted):
@@ -191,16 +191,27 @@ class BuildingStyleTree(NodeTree):
                     sock_names.user_name = socket.user_name or socket.default_name
 
     def update_sockets(self):
-        """ Supports:
-        - adding sockets to the end of input output collections
+        """ Supports (only for nodes with template attributes):
+        - adding sockets from a template which identifier was not found in a sockets collection
+        - marking sockets as deprecated which identifiers are not found in a template
         """
         for node in self.nodes:
-            for sock, template in zip(chain(node.inputs, [None]), node.input_template):
-                if sock is None:
-                    template.init(node, is_input=True)
-            for sock, template in zip(chain(node.outputs, [None]), node.output_template):
-                if sock is None:
-                    template.init(node, is_input=False)
+            if node.input_template:
+                socks = {s.identifier: s for s in node.inputs}
+                for pos, (key, template) in enumerate(zip(node.input_template._fields, node.input_template)):
+                    if key not in socks:
+                        template.init(node, is_input=True, identifier=key)
+                        node.inputs.move(len(node.inputs) - 1, pos)
+                for key, sock in socks.items():
+                    sock.is_deprecated = not hasattr(node.input_template, key)
+            if node.output_template:
+                socks = {s.identifier: s for s in node.outputs}
+                for pos, (key, template) in enumerate(zip(node.output_template._fields, node.output_template)):
+                    if key not in socks:
+                        template.init(node, is_input=False, identifier=key)
+                        node.outputs.move(len(node.outputs) - 1, pos)
+                for key, sock in socks.items():
+                    sock.is_deprecated = not hasattr(node.output_template, key)
 
     def show_in_areas(self, is_to_show):
         for area in bpy.context.screen.areas:
@@ -216,6 +227,7 @@ class BaseSocket:
         self.update_value(context)
 
     user_name: bpy.props.StringProperty(description="Socket name given by user")  # todo tag redraw
+    is_deprecated: bpy.props.BoolProperty(description="In case the socket is not used by a node any more")
     is_to_show: bpy.props.BoolProperty(
         default=True, description="To display the socket in node interface", update=update_is_to_show)
 
@@ -223,9 +235,16 @@ class BaseSocket:
         self.id_data.update()  # https://developer.blender.org/T92635
 
     def draw(self, context, layout, node, text):
-        if hasattr(self, 'value') and not self.is_output and not self.is_linked:
+        if self.is_deprecated:
+            row = layout.row()
+            row.alert = True
+            row.label(text=f'{self.user_name or text or self.default_name} (deprecated)')
+            row.operator(EditSocketsOperator.bl_idname, text='', icon='REMOVE').operation = 'delete'
+
+        elif hasattr(self, 'value') and not self.is_output and not self.is_linked:
             col = layout.column()
             col.prop(self, 'value', text=(self.user_name or text or self.default_name) if self.show_text else '')
+
         else:
             layout.label(text=self.user_name or text or self.default_name)
 
@@ -531,7 +550,8 @@ class PanelNode(BaseNode, Node):
         SocketTemplate(Vector4Socket, 'Scope padding', enabled=False),
         SocketTemplate(FloatSocket, 'Probability', enabled=False, default_value=1),
     )
-    output_template = [SocketTemplate(PanelSocket)]
+    Outputs = namedtuple('Outputs', ['panel'])
+    output_template = Outputs(SocketTemplate(PanelSocket))
 
     mode: bpy.props.EnumProperty(items=[(i, i, '') for i in ['Object', 'Collection']])
     panel_index: bpy.props.IntProperty(description="Penal index in the collection")
@@ -924,14 +944,16 @@ class FacadePatternNode(BaseNode, Node):
     bl_idname = 'bn_FacadePatternNode'
     bl_label = "Facade Pattern"
     category = Categories.FACADE
-    Inputs = namedtuple('Inputs', ['last', 'fill', 'distribute', 'first'])
-
-    def node_init(self):
-        self.inputs.new(FloorSocket.bl_idname, "Last")
-        self.inputs.new(FloorSocket.bl_idname, "Fill")
-        self.inputs.new(FloorSocket.bl_idname, "Distribute")
-        self.inputs.new(FloorSocket.bl_idname, "First")
-        self.outputs.new(FacadeSocket.bl_idname, "")
+    Inputs = namedtuple('Inputs', ['contribution', 'last', 'fill', 'distribute', 'first'])
+    input_template = Inputs(
+        SocketTemplate(FloatSocket, 'Contribution', False, default_value=1),
+        SocketTemplate(FloorSocket, 'Last'),
+        SocketTemplate(FloorSocket, 'Fill'),
+        SocketTemplate(FloorSocket, 'Distribute'),
+        SocketTemplate(FloorSocket, 'First'),
+    )
+    Outputs = namedtuple('Outputs', ['facade'])
+    output_template = Outputs(SocketTemplate(FacadeSocket))
 
     @staticmethod
     def execute(inputs: Inputs, params):
@@ -990,8 +1012,12 @@ class FacadePatternNode(BaseNode, Node):
                             is_fill_fixed = not build.depth
                         else:
                             floors_stack.repeat_last()
+                elif inputs.last and 'TOP' in build.cur_facade_face.position\
+                        and not floors_stack.is_full(build.cur_facade.size.y):
+                    floors_stack.add_floor(build, inputs.last)
+
                 if facade_face:
-                    floors_stack.instance_floors(build)
+                    floors_stack.instance_floors(build, floors_stack.is_full(build.cur_facade.size.y))
             return True
 
         return facade_generator
@@ -1405,6 +1431,7 @@ class EditSocketsOperator(Operator):
     tree_name: bpy.props.StringProperty()
     node_name: bpy.props.StringProperty()
     socket_identifier: bpy.props.StringProperty()
+    is_output: BoolProperty()
     old_socket_name: bpy.props.StringProperty()
     new_socket_name: bpy.props.StringProperty(name='New name')
 
@@ -1422,24 +1449,25 @@ class EditSocketsOperator(Operator):
     def execute(self, context):
         tree = bpy.data.node_groups[self.tree_name]
         node = tree.nodes[self.node_name]
-        socket = next(s for s in node.inputs if s.identifier == self.socket_identifier)
+        sock_col = node.outputs if self.is_output else node.inputs
+        socket = next(s for s in sock_col if s.identifier == self.socket_identifier)
         if self.operation == 'add':
-            node.inputs.new(socket.bl_idname, '')
-            position = next(i for i, s in enumerate(node.inputs) if s.identifier == socket.identifier) + 1
-            node.inputs.move(len(node.inputs) - 1, position)
+            sock_col.new(socket.bl_idname, '')
+            position = next(i for i, s in enumerate(sock_col) if s.identifier == socket.identifier) + 1
+            sock_col.move(len(sock_col) - 1, position)
         elif self.operation == 'delete':
-            node.inputs.remove(socket)
+            sock_col.remove(socket)
         elif self.operation == 'rename':
             if self.new_socket_name.lower() == 'fill':
                 self.report({'ERROR_INVALID_INPUT'}, f'"{self.new_socket_name}" socket name is forbidden')
                 return {'CANCELLED'}
             socket.user_name = self.new_socket_name
         elif self.operation == 'move_up':
-            current_index = next(i for i, s in enumerate(node.inputs) if s.identifier == socket.identifier)
-            node.inputs.move(current_index, max([current_index - 1, 1]))
+            current_index = next(i for i, s in enumerate(sock_col) if s.identifier == socket.identifier)
+            sock_col.move(current_index, max([current_index - 1, 1]))
         elif self.operation == 'move_down':
-            current_index = next(i for i, s in enumerate(node.inputs) if s.identifier == socket.identifier)
-            node.inputs.move(current_index, current_index + 1)
+            current_index = next(i for i, s in enumerate(sock_col) if s.identifier == socket.identifier)
+            sock_col.move(current_index, current_index + 1)
         else:
             raise TypeError(f"It is not known how to handle the operation={self.operation}")
         tree.update_facade_names()
@@ -1453,6 +1481,7 @@ class EditSocketsOperator(Operator):
         self.tree_name = context.node.id_data.name
         self.node_name = context.node.name
         self.socket_identifier = context.socket.identifier
+        self.is_output = context.socket.is_output
         self.old_socket_name = context.socket.user_name
         self.new_socket_name = context.socket.name
         wm = context.window_manager
@@ -1715,8 +1744,8 @@ class FloorsStack:
     def is_full(self, height: float):
         return height < self._current_height
 
-    def instance_floors(self, build):
-        z_scale = (build.cur_facade_face.size.y / self._current_height) if self._current_height else 1
+    def instance_floors(self, build, is_to_scale):
+        z_scale = (build.cur_facade_face.size.y / self._current_height) if self._current_height and is_to_scale else 1
         real_floors_height = 0
         for floor in self.floors:
             if not floor:
@@ -1797,13 +1826,14 @@ class Facade:
 
 
 class Building:
-    def __init__(self, start_level: float):
+    def __init__(self, start_level: float, end_level: float):
         bm = bmesh.new()
         self.norm_lay = bm.verts.layers.float_vector.new("Normal")
         self.scale_lay = bm.verts.layers.float_vector.new("Scale")
         self.ind_lay = bm.verts.layers.int.new("Wall index")
         self.bm: bmesh.types.BMesh = bm
         self.start_level: float = start_level
+        self.end_level: float = end_level
 
         self.cur_facade: Facade = None
         self.cur_facade_face: FacadeFace = None
