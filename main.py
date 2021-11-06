@@ -13,6 +13,7 @@ import bmesh
 import bpy
 from bmesh.types import BMEdge, BMFace, BMLoop, BMVert
 from bpy.app.handlers import persistent
+from bpy.props import StringProperty
 from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
 import nodeitems_utils
 from mathutils import Vector
@@ -83,7 +84,9 @@ class BuildingStyleTree(NodeTree):
             if node.bl_idname == FacadeInstanceNode.bl_idname:
                 return node.execute(node.gen_input_mapping()(*in_data), base_bm, obj_facade_names)
             else:
-                if hasattr(node, 'Props'):
+                if node.props_template:
+                    props = node.props_template
+                elif hasattr(node, 'Props'):
                     props = node.Props(*[getattr(node, n) for n in node.Props._fields])
                 else:
                     props = None
@@ -166,6 +169,17 @@ class BuildingStyleTree(NodeTree):
         for node in TopologicalSorter(node_graph).static_order():
             yield node, [prev_sock[s] if s in prev_sock else None for s in node.inputs]
 
+    def walk_back(self, from_node: Node) -> Iterable[Node]:
+        nodes = {l.to_socket: l.from_node for l in self.links}
+        prev_nodes = [from_node]
+        visited = set()
+        while prev_nodes:
+            if (node := prev_nodes.pop()) in visited:
+                continue
+            yield node
+            visited.add(node)
+            prev_nodes.extend(prev_node for s in node.inputs if (prev_node := nodes.get(s)) is not None)
+
     def update_facade_names(self):
         # todo make interface of all output nodes equal
         for node in self.nodes:
@@ -196,7 +210,14 @@ class BuildingStyleTree(NodeTree):
 
 class BaseSocket:
     show_text = True
+
+    def update_is_to_show(self, context):
+        self.enabled = self.is_to_show
+        self.update_value(context)
+
     user_name: bpy.props.StringProperty(description="Socket name given by user")  # todo tag redraw
+    is_to_show: bpy.props.BoolProperty(
+        default=True, description="To display the socket in node interface", update=update_is_to_show)
 
     def update_value(self, context):
         self.id_data.update()  # https://developer.blender.org/T92635
@@ -339,10 +360,10 @@ class ShowSocketsMenu(Menu):
             if sock.is_linked:
                 col = self.layout.column()
                 col.active = False
-                col.prop(sock, 'enabled', text=(sock.name or sock.default_name) + ' (connected)', emboss=False)
+                col.prop(sock, 'is_to_show', text=(sock.name or sock.default_name) + ' (connected)', emboss=False)
             else:
                 col = self.layout.column()
-                col.prop(sock, 'enabled', text=sock.name or sock.default_name)
+                col.prop(sock, 'is_to_show', text=sock.name or sock.default_name)
 
 
 class SocketTemplate(NamedTuple):
@@ -352,11 +373,11 @@ class SocketTemplate(NamedTuple):
     display_shape: Literal['CIRCLE', 'SQUARE', 'DIAMOND', 'CIRCLE_DOT', 'SQUARE_DOT', 'DIAMOND_DOT'] = None
     default_value: Any = None
 
-    def init(self, node: Node, is_input):
+    def init(self, node: Node, is_input, identifier=None):
         node_sockets = node.inputs if is_input else node.outputs
-        sock = node_sockets.new(self.type.bl_idname, self.name)
+        sock = node_sockets.new(self.type.bl_idname, self.name, identifier=identifier or '')
         if not self.enabled:
-            sock.enabled = False
+            sock.is_to_show = False
         if self.display_shape:
             sock.display_shape = self.display_shape
         if self.default_value is not None:
@@ -369,6 +390,7 @@ class BaseNode:
     repeat_first_socket = False
     input_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
     output_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
+    props_template: tuple = []
 
     @classmethod
     def poll(cls, tree):
@@ -380,10 +402,10 @@ class BaseNode:
             self.use_custom_color = True
             self.color = self.category.color
         # create sockets
-        for s_template in self.input_template:
-            s_template.init(self, is_input=True)
-        for s_template in self.output_template:
-            s_template.init(self, is_input=False)
+        for key, s_template in zip(self.input_template and self.input_template._fields, self.input_template):
+            s_template.init(self, is_input=True, identifier=key)
+        for key, s_template in zip(self.output_template and self.output_template._fields, self.output_template):
+            s_template.init(self, is_input=False, identifier=key)
 
         self.node_init()
 
@@ -428,6 +450,11 @@ class BaseNode:
         elif hasattr(self, 'Inputs'):
             return self.Inputs
         return namedtuple('Inputs', input_names) if input_names else None
+
+    def get_socket(self, identifier, is_input) -> Optional[NodeSocket]:
+        for socket in self.inputs if is_input else self.outputs:
+            if socket.identifier == identifier:
+                return socket
 
 
 class FacadeInstanceNode(BaseNode, Node):
@@ -513,6 +540,10 @@ class PanelNode(BaseNode, Node):
         row = layout.row(align=True)
         row.prop(self, "mode", expand=True)
         row.menu(ShowSocketsMenu.bl_idname, text='', icon='DOWNARROW_HLT')
+
+    def draw_label(self):
+        obj_socket = self.get_socket('object', is_input=True)
+        return obj_socket.value and obj_socket.value.name or self.bl_label
 
     @staticmethod
     def execute(inputs: Inputs, props: Props):
@@ -609,6 +640,44 @@ class SetPanelAttributeNode(BaseNode, Node):
         return set_panel_attr
 
 
+class PanelRandomizePropsOperator(Operator):
+    bl_idname = "bn.panel_randomize_props"
+    bl_label = "Edit the node options"
+    bl_options = {'INTERNAL', }
+
+    # internal usage
+    tree_name: StringProperty()
+    node_name: StringProperty()
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        node = context.node
+        self.tree_name = node.id_data.name
+        self.node_name = node.name
+        panel_names = []
+        for search_node in node.id_data.walk_back(node):
+            if search_node.bl_idname == PanelNode.bl_idname:
+                panel_names.append(search_node.name)
+        node['panel_names'] = panel_names
+        wm = context.window_manager
+        return wm.invoke_props_dialog(self)
+
+    def draw(self, context):
+        tree = bpy.data.node_groups[self.tree_name]
+        node = tree.nodes[self.node_name]  # todo https://developer.blender.org/T92835
+        col = self.layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(node.inputs['Seed'], 'value', text='Node seed')
+        col = col.column(align=True)
+        for panel_node_name in node['panel_names']:
+            panel_node = tree.nodes[panel_node_name]
+            socket = panel_node.get_socket('probability', is_input=True)
+            col.prop(socket, 'value', text=f"{panel_node.draw_label()} probability")
+
+
 class PanelRandomizeNode(BaseNode, Node):
     bl_idname = 'bn_PanelRandomizeNode'
     bl_label = "Panel Randomize"
@@ -621,6 +690,9 @@ class PanelRandomizeNode(BaseNode, Node):
         self.inputs.new(PanelSocket.bl_idname, "")
         self.outputs.new(PanelSocket.bl_idname, "")
 
+    def draw_buttons(self, context, layout):
+        layout.operator(PanelRandomizePropsOperator.bl_idname, text='Settings', icon='PREFERENCES')
+
     @staticmethod
     def execute(inputs: Inputs, params):
         random_streams = dict()
@@ -630,7 +702,7 @@ class PanelRandomizeNode(BaseNode, Node):
             if stream is None:
                 stream = random.Random(int(inputs.seed(build)))
                 random_streams[build.cur_facade.cur_floor_ind] = stream
-            panels = [inp(build) for inp in inputs[1: -1] if inp is not None]
+            panels = [p for inp in inputs[1: -1] if (p := inp(build)) is not None]
             return stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
 
@@ -672,19 +744,26 @@ class FloorPatternNode(BaseNode, Node):
     bl_label = "Floor Pattern"
     category = Categories.FLOOR
     Inputs = namedtuple('Inputs', ['height', 'left', 'fill', 'distribute', 'right'])
+    input_template = Inputs(
+        SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT', 3),
+        SocketTemplate(PanelSocket, 'Left'),
+        SocketTemplate(PanelSocket, 'Fill'),
+        SocketTemplate(PanelSocket, 'Distribute'),
+        SocketTemplate(PanelSocket, 'Right'),
+    )
+    Outputs = namedtuple('Outputs', ['floor'])
+    output_template = Outputs(SocketTemplate(FloorSocket))
+    Props = namedtuple('Props', ['use_height'])
 
-    def node_init(self):
-        s = self.inputs.new(FloatSocket.bl_idname, "Height")
-        s.value = 3
-        s.display_shape = 'DIAMOND_DOT'
-        self.inputs.new(PanelSocket.bl_idname, "Left")
-        self.inputs.new(PanelSocket.bl_idname, "Fill")
-        self.inputs.new(PanelSocket.bl_idname, "Distribute")
-        self.inputs.new(PanelSocket.bl_idname, "Right")
-        self.outputs.new(FloorSocket.bl_idname, "")
+    @property
+    def props_template(self) -> Props:
+        return self.Props(self.get_socket('height', is_input=True).is_to_show)
+
+    def draw_buttons(self, context, layout):
+        layout.menu(ShowSocketsMenu.bl_idname, text='Show sockets')
 
     @classmethod
-    def execute(cls, inputs: Inputs, params):
+    def execute(cls, inputs: Inputs, props: Props):
         def floor_gen(build: Building, precompute=False):
             if precompute:
                 floor = Floor(build.cur_facade.cur_floor_ind)
@@ -693,19 +772,26 @@ class FloorPatternNode(BaseNode, Node):
 
             floor = Floor(build.cur_facade.cur_floor_ind)
             build.cur_floor = floor
-            floor.height = inputs.height(build)
             pan_stack = floor.panels_stack
-            if inputs.left:
+            if "LEFT" in build.cur_facade_face.position and inputs.left:
                 pan_stack.add_panel(build, inputs.left, 'LEFT')
-            if inputs.right:
+            if 'RIGHT' in build.cur_facade_face.position and inputs.right:
                 pan_stack.add_panel(build, inputs.right, 'RIGHT')
             if inputs.fill and not pan_stack.is_full(build):
                 for i in range(1000):
-                    panel = pan_stack.add_panel(build, inputs.fill)
+                    panel = None
+                    for _ in range(10):
+                        panel = pan_stack.add_panel(build, inputs.fill)
+                        if panel:
+                            break
                     if panel is None or pan_stack.is_full(build):
                         break
 
             if pan_stack.has_panels:
+                if props.use_height:
+                    floor.height = inputs.height(build)
+                else:
+                    floor.height = max((p.size.y for p in pan_stack.all_panels), default=0)
                 pan_stack.update_location_scale(build)
                 return floor
             else:
@@ -1534,27 +1620,27 @@ class PanelsStack:
     def add_panel(self, build, panel_f, p_type: Literal['LEFT', 'FILL', 'RIGHT'] = 'FILL'):
         build.cur_facade.cur_panel_ind = len(self._panels) if p_type == 'FILL' else 0
         panel: Panel = panel_f(build)
-        if panel is not None:
-            z_scale = build.cur_floor.height / panel.size.y
-            panel.scale *= Vector((z_scale, z_scale))
-            self._stack_width += panel.instance_size.x
-            if p_type == 'FILL':
-                self._panels.append(panel)
-            elif p_type == 'LEFT':
-                self._left_panel.append(panel)
-            elif p_type == 'RIGHT':
-                self._right_panel.append(panel)
-            return panel
+        self._stack_width += panel and panel.size.x or 0
+        if p_type == 'FILL':
+            self._panels.append(panel)
+        elif p_type == 'LEFT':
+            self._left_panel.append(panel)
+        elif p_type == 'RIGHT':
+            self._right_panel.append(panel)
+        return panel
 
     def is_full(self, build):
         return self._stack_width > build.cur_facade_face.size.x
 
     def update_location_scale(self, build):
+        if not self.has_panels:
+            return
         facade_face = build.cur_facade_face
         xy_scale = build.cur_facade_face.size.x / self._stack_width
         xy_shift = 0
-        for panel in self.all_panels:
-            panel.scale *= Vector((xy_scale, 1))
+        for panel in (p for p in self.all_panels if p):
+            z_scale = build.cur_floor.height / panel.size.y
+            panel.scale *= Vector((xy_scale, z_scale))
             size = panel.instance_size.x
             xy_shift += size / 2
             panel.location = facade_face.start + facade_face.direction * xy_shift
@@ -1562,11 +1648,11 @@ class PanelsStack:
 
     @property
     def has_panels(self) -> bool:
-        return any([self._left_panel, self._panels, self._right_panel])
+        return any(self.all_panels)
 
     @property
     def all_panels(self) -> Iterable[Panel]:
-        return chain(self._left_panel, self._panels, self._right_panel)
+        return (p for p in chain(self._left_panel, self._panels, self._right_panel) if p is not None)
 
     def __repr__(self):
         str_panels = ', '.join(str(p) for p in chain([self._left_panel], self._panels, [self._right_panel]) if p)
@@ -1630,7 +1716,7 @@ class FloorsStack:
         return height < self._current_height
 
     def instance_floors(self, build):
-        z_scale = build.cur_facade_face.size.y / self._current_height
+        z_scale = (build.cur_facade_face.size.y / self._current_height) if self._current_height else 1
         real_floors_height = 0
         for floor in self.floors:
             if not floor:
@@ -1656,7 +1742,7 @@ class FacadeFace:
         self.direction: Vector = (dist_vec * Vector((1, 1, 0))).normalized()
         self.normal = left_loop.face.normal
         self.floors_stack: FloorsStack = FloorsStack(template and template.floors_stack.floors[0].index)
-        self.position = pos
+        self.position: set[Literal['LEFT', 'RIGHT', 'TOP']] = pos
         self.template_floors = template
 
         self.azimuth = None
