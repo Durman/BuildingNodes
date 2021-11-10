@@ -13,7 +13,7 @@ import bmesh
 import bpy
 from bmesh.types import BMEdge, BMFace, BMLoop, BMVert
 from bpy.app.handlers import persistent
-from bpy.props import StringProperty, BoolProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty
 from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
 import nodeitems_utils
 from mathutils import Vector
@@ -70,27 +70,35 @@ class BuildingStyleTree(NodeTree):
         self.store_instances()
         sock_data = dict()
         for node, prev_socks in self.walk():
-            in_data = []
+            in_data = dict()
             for from_sock, to_sock in zip(prev_socks, node.inputs):
                 if from_sock is not None:
-                    in_data.append(sock_data[from_sock])
+                    in_data[to_sock.identifier] = sock_data[from_sock]
                 elif hasattr(to_sock, 'value'):
                     def sock_value(build, *, _value=to_sock.value):
                         return _value
-                    in_data.append(sock_value)
+                    in_data[to_sock.identifier] = sock_value
                 else:
-                    in_data.append(None)
+                    in_data[to_sock.identifier] = None
 
-            if node.bl_idname == FacadeInstanceNode.bl_idname:
-                return node.execute(node.gen_input_mapping()(*in_data), base_bm, obj_facade_names)
+            if node.bl_idname == BuildingStyleNode.bl_idname:
+                return node.execute(node.gen_input_mapping()(*in_data.values()), base_bm, obj_facade_names)
             else:
+                # collect properties
                 if node.props_template:
                     props = node.props_template
                 elif hasattr(node, 'Props'):
                     props = node.Props(*[getattr(node, n) for n in node.Props._fields])
                 else:
                     props = None
-                res = node.execute(Inp(*in_data) if (Inp := node.gen_input_mapping()) is not None else None, props)
+
+                # find inputs mapping
+                if node.input_template:  # this says that sockets have appropriate identifiers
+                    input_data = node.Inputs(*[in_data[key] for key in node.Inputs._fields])  # key words
+                else:  # positional
+                    input_data = (Inp := node.gen_input_mapping()) and Inp(*in_data.values())
+
+                res = node.execute(input_data, props)
                 if not isinstance(res, tuple):
                     res = (res, )
                 for data, out_sok in zip(res, node.outputs):
@@ -146,9 +154,10 @@ class BuildingStyleTree(NodeTree):
             self.inst_col.objects.unlink(obj)
         for node in self.nodes:
             if node.bl_idname == PanelNode.bl_idname:
-                if node.inputs[0].value is not None:
+                sock = node.get_socket('object', is_input=True)
+                if sock.value is not None:
                     try:
-                        self.inst_col.objects.link(node.inputs[0].value)
+                        self.inst_col.objects.link(sock.value)
                     except RuntimeError:
                         pass  # Already was linked
 
@@ -183,7 +192,7 @@ class BuildingStyleTree(NodeTree):
     def update_facade_names(self):
         # todo make interface of all output nodes equal
         for node in self.nodes:
-            if node.bl_idname == FacadeInstanceNode.bl_idname:
+            if node.bl_idname == BuildingStyleNode.bl_idname:
                 self.facade_names.clear()
                 for socket in node.inputs[1:]:
                     sock_names: FacadeTreeNames = self.facade_names.add()
@@ -355,6 +364,7 @@ class Vector4Socket(BaseSocket, NodeSocket):
 
 
 class Categories(Enum):
+    BUILDING = auto()
     FACADE = auto()
     FLOOR = auto()
     PANEL = auto()
@@ -366,6 +376,7 @@ class Categories(Enum):
             Categories.PANEL: (0.3, 0.45, 0.5),
             Categories.FLOOR: (0.25, 0.25, 0.4),
             Categories.FACADE: (0.4, 0.25, 0.4),
+            Categories.BUILDING: (0.3, 0.15, 0.15),
         }
         return colors.get(self)
 
@@ -460,15 +471,15 @@ class BaseNode:
         pass
 
     def gen_input_mapping(self) -> Optional[Type[NamedTuple]]:
-        input_names = []
-        index = count()
-        if self.repeat_last_socket or self.bl_idname == FacadeInstanceNode.bl_idname:
+        if self.repeat_last_socket or self.bl_idname == BuildingStyleNode.bl_idname:
+            input_names = []
+            index = count()
             for sock in self.inputs:
                 inp_name = sock.name or sock.default_name + str(next(index))
                 input_names.append(inp_name.lower().replace(' ', '_'))
+            return namedtuple('Inputs', input_names) if input_names else None
         elif hasattr(self, 'Inputs'):
             return self.Inputs
-        return namedtuple('Inputs', input_names) if input_names else None
 
     def get_socket(self, identifier, is_input) -> Optional[NodeSocket]:
         for socket in self.inputs if is_input else self.outputs:
@@ -476,11 +487,11 @@ class BaseNode:
                 return socket
 
 
-class FacadeInstanceNode(BaseNode, Node):
-    bl_idname = 'bn_FacadeInstanceNode'
-    bl_label = "Facade Instance"
-    category = Categories.FACADE
-    Inputs = namedtuple('Inputs', ['fill', 'facade0', 'facade1', 'facade2'])
+class BuildingStyleNode(BaseNode, Node):
+    bl_idname = 'bn_BuildingStyleNode'
+    bl_label = "Building Style"
+    category = Categories.BUILDING
+    Inputs = namedtuple('Inputs', ['facade', 'facade0', 'facade1', 'facade2'])
 
     edit_sockets: bpy.props.BoolProperty(name='Edit')
 
@@ -513,12 +524,16 @@ class FacadeInstanceNode(BaseNode, Node):
             if is_valid and facade_func:
 
                 face_loops = build.get_floor_polygons(face)
-                for loop, _ in face_loops:
-                    loop.face[wall_lay] = 1
-                    visited.add(loop.face)
-
                 build.cur_facade = Facade(face_loops)
-                facade_func(build)
+
+                for facade_face in build.cur_facade.facade_faces_stack.facade_face_inter(build):
+                    visited.add(facade_face.face)
+                    build.cur_facade_face = facade_face
+                    if facade_func(build):
+                        facade_face.face[wall_lay] = 1
+                    else:
+                        facade_face.face[wall_lay] = 0
+
             else:
                 face[wall_lay] = 0
 
@@ -759,6 +774,43 @@ class StackPanelsNode(BaseNode, Node):
         self.outputs.new(PanelSocket.bl_idname, "")
 
 
+class PanelItemsNode(BaseNode, Node):
+    bl_idname = 'bn_PanelItemsNode'
+    bl_label = "Panel Items"
+    category = Categories.PANEL
+    repeat_last_socket = True
+    Inputs = namedtuple('Inputs', ['index', 'panel0', 'panel1', 'panel2'])
+    Props = namedtuple('Props', ['match_mode'])
+
+    match_mode: EnumProperty(items=[(i.upper(), i, '') for i in ['None', 'Repeat', 'Cycle']],
+                             update=lambda s, c: s.id_data.update())
+
+    def node_init(self):
+        self.inputs.new(IntSocket.bl_idname, "Index").display_shape = 'DIAMOND_DOT'
+        self.inputs.new(PanelSocket.bl_idname, "")
+        self.outputs.new(PanelSocket.bl_idname, "")
+
+    def draw_buttons(self, context, layout):
+        row = layout.row()
+        row.prop(self, 'match_mode', expand=True)
+
+    @staticmethod
+    def execute(inputs: Inputs, props: Props):
+        def get_facade_item(build: Building):
+            panel_funcs = {i: f for i, f in enumerate(inputs[1:]) if f is not None}
+            if props.match_mode == 'NONE':
+                index = inputs.index(build)
+            elif props.match_mode == 'REPEAT':
+                index = min(len(panel_funcs) - 1, inputs.index(build))
+            elif props.match_mode == 'CYCLE':
+                index = inputs.index(build) % len(panel_funcs)
+            panel_f = panel_funcs.get(index)
+            if panel_f:
+                return panel_f(build)
+
+        return get_facade_item
+
+
 class FloorPatternNode(BaseNode, Node):
     bl_idname = 'bn_FloorPatternNode'
     bl_label = "Floor Pattern"
@@ -823,14 +875,12 @@ class FloorAttributesNode(BaseNode, Node):
     bl_idname = 'bn_FloorAttributesNode'
     bl_label = "Floor Attributes"
     category = Categories.FLOOR
-
-    def node_init(self):
-        self.outputs.new(FloatSocket.bl_idname, "Width").display_shape = 'DIAMOND'
-        self.outputs.new(FloatSocket.bl_idname, "Height").display_shape = 'DIAMOND'
-        self.outputs.new(IntSocket.bl_idname, "Number").display_shape = 'DIAMOND'
-        self.outputs.new(FloatSocket.bl_idname, "Left corner angle").display_shape = 'DIAMOND'
-        self.outputs.new(FloatSocket.bl_idname, "Right corner angle").display_shape = 'DIAMOND'
-        self.outputs.new(FloatSocket.bl_idname, "Azimuth").display_shape = 'DIAMOND'
+    Outputs = namedtuple('Outputs', ['width', 'height', 'index'])
+    output_template = Outputs(
+        SocketTemplate(FloatSocket, 'Width', display_shape='DIAMOND'),
+        SocketTemplate(FloatSocket, 'Height', display_shape='DIAMOND'),
+        SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND'),
+    )
 
     @staticmethod
     def execute(inputs, props):
@@ -844,15 +894,7 @@ class FloorAttributesNode(BaseNode, Node):
             build.depth.add('floor_index')
             return build.cur_facade.cur_floor_ind
 
-        def left_corner_angle(build: Building):
-            return build.cur_facade.left_wall_angle
-
-        def right_corner_angle(build: Building):
-            return build.cur_facade.right_wall_angle
-
-        def azimuth(build: Building):
-            return build.cur_facade.azimuth
-        return floor_width, floor_height, floor_index, left_corner_angle, right_corner_angle, azimuth
+        return floor_width, floor_height, floor_index
 
 
 class FloorSwitchNode(BaseNode, Node):
@@ -958,69 +1000,98 @@ class FacadePatternNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         def facade_generator(build: Building):
-            for facade_face in build.cur_facade.facade_faces_stack.facade_face_inter(build):
-                floors_stack = facade_face.floors_stack
-
-                # searching first floor index
-                if floors_stack.first_index is None:
-                    is_fill_fixed = False
-                    floors_stack.first_index = 0
-                    start_height = facade_face.start.z - build.start_level
-                    if not isclose(start_height, 0, abs_tol=0.1):
-                        if inputs.first:
-                            floors_stack.add_floor(build, inputs.first, mockup=True)
-                        if inputs.fill:
-                            for i in range(10000):
-                                if floors_stack.is_full(start_height):
-                                    break
-                                if not is_fill_fixed:
-                                    floor = None
-                                    for _ in range(10):
-                                        floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
-                                        if floor:
-                                            break
-                                    if floor is None:
-                                        break
-                                    is_fill_fixed = not build.depth
-                                else:
-                                    floors_stack.repeat_last()
-                        start_index = len(floors_stack.floors)
-                        floors_stack.clear(start_index)
-
-                # generate floors
+            facade_face = build.cur_facade_face
+            floors_stack = facade_face.floors_stack
+            # searching first floor index
+            if floors_stack.first_index is None:
                 is_fill_fixed = False
-                if inputs.first and floors_stack.first_index == 0:
-                    floors_stack.add_floor(build, inputs.first)
-                if inputs.fill:
-                    for i in range(10000):
-                        if inputs.last and 'TOP' in build.cur_facade_face.position:
-                            if floors_stack.will_be_last_floor(build, inputs.last, build.cur_facade.size.y):
-                                floors_stack.add_floor(build, inputs.last)
+                floors_stack.first_index = 0
+                start_height = facade_face.start.z - build.start_level
+                if not isclose(start_height, 0, abs_tol=0.1):
+                    if inputs.first:
+                        floors_stack.add_floor(build, inputs.first, mockup=True)
+                    if inputs.fill:
+                        for i in range(10000):
+                            if floors_stack.is_full(start_height):
                                 break
-                        else:
-                            if floors_stack.is_full(build.cur_facade.size.y):
-                                break
-
-                        if not is_fill_fixed:
-                            floor = None
-                            for _ in range(10):
-                                floor = floors_stack.add_floor(build, inputs.fill)
-                                if floor:
+                            if not is_fill_fixed:
+                                floor = None
+                                for _ in range(10):
+                                    floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
+                                    if floor:
+                                        break
+                                if floor is None:
                                     break
-                            if floor is None:
-                                break
-                            is_fill_fixed = not build.depth
-                        else:
-                            floors_stack.repeat_last()
-                elif inputs.last and 'TOP' in build.cur_facade_face.position\
-                        and not floors_stack.is_full(build.cur_facade.size.y):
-                    floors_stack.add_floor(build, inputs.last)
+                                is_fill_fixed = not build.depth
+                            else:
+                                floors_stack.repeat_last()
+                    start_index = len(floors_stack.floors)
+                    floors_stack.clear(start_index)
 
-                if facade_face:
-                    floors_stack.instance_floors(build, floors_stack.is_full(build.cur_facade.size.y))
-            return True
+            # generate floors
+            is_fill_fixed = False
+            if inputs.first and floors_stack.first_index == 0:
+                floors_stack.add_floor(build, inputs.first)
+            if inputs.fill:
+                for i in range(10000):
+                    if inputs.last and 'TOP' in build.cur_facade_face.position:
+                        if floors_stack.will_be_last_floor(build, inputs.last, build.cur_facade.size.y):
+                            floors_stack.add_floor(build, inputs.last)
+                            break
+                    else:
+                        if floors_stack.is_full(build.cur_facade.size.y):
+                            break
+
+                    if not is_fill_fixed:
+                        floor = None
+                        for _ in range(10):
+                            floor = floors_stack.add_floor(build, inputs.fill)
+                            if floor:
+                                break
+                        if floor is None:
+                            break
+                        is_fill_fixed = not build.depth
+                    else:
+                        floors_stack.repeat_last()
+            elif inputs.last and 'TOP' in build.cur_facade_face.position\
+                    and not floors_stack.is_full(build.cur_facade.size.y):
+                floors_stack.add_floor(build, inputs.last)
+
+            if facade_face:
+                floors_stack.instance_floors(build, inputs.fill or floors_stack.is_full(build.cur_facade.size.y))
+                return True
+            else:
+                return False
 
         return facade_generator
+
+
+class FacadeAttributesNode(BaseNode, Node):
+    bl_idname = 'bn_FacadeAttributesNode'
+    bl_label = 'Facade Attributes'
+    category = Categories.FACADE
+    Outputs = namedtuple('Outputs', ['left_angle', 'right_angle', 'azimuth', 'mat_id'])
+    output_template = Outputs(
+        SocketTemplate(FloatSocket, 'Left corner angle', display_shape='DIAMOND'),
+        SocketTemplate(FloatSocket, 'Right corner angle', display_shape='DIAMOND'),
+        SocketTemplate(FloatSocket, 'Azimuth', display_shape='DIAMOND'),
+        SocketTemplate(IntSocket, 'Material index', display_shape='DIAMOND'),
+    )
+
+    @staticmethod
+    def execute(inputs, props):
+        def left_corner_angle(build: Building):
+            return build.cur_facade.left_wall_angle
+
+        def right_corner_angle(build: Building):
+            return build.cur_facade.right_wall_angle
+
+        def azimuth(build: Building):
+            return build.cur_facade.azimuth
+
+        def material_id(build: Building):
+            return build.cur_facade_face.material_ind
+        return left_corner_angle, right_corner_angle, azimuth, material_id
 
 
 class SetFacadeAttributeNode(BaseNode, Node):
@@ -1043,6 +1114,29 @@ class SetFacadeAttributeNode(BaseNode, Node):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "attribute", text='')
+
+
+class FacadeItemsNode(BaseNode, Node):
+    bl_idname = 'bn_FacadeItemsNode'
+    bl_label = "Facade Items"
+    category = Categories.FACADE
+    repeat_last_socket = True
+    Inputs = namedtuple('Inputs', ['index', 'facade0', 'facade1', 'facade2'])
+
+    def node_init(self):
+        self.inputs.new(IntSocket.bl_idname, "Index").display_shape = 'DIAMOND_DOT'
+        self.inputs.new(FacadeSocket.bl_idname, "")
+        self.outputs.new(FacadeSocket.bl_idname, "")
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def get_facade_item(build: Building):
+            facade_funcs = {i: f for i, f in enumerate(inputs[1:])}
+            facade_f = facade_funcs.get(inputs.index(build))
+            if facade_f:
+                return facade_f(build)
+
+        return get_facade_item
 
 
 class MathNode(BaseNode, Node):
@@ -1386,7 +1480,7 @@ class AddNewBuildingStyleOperator(Operator):
         node1 = tree.nodes.new(PanelNode.bl_idname)
         node2 = tree.nodes.new(FloorPatternNode.bl_idname)
         node3 = tree.nodes.new(FacadePatternNode.bl_idname)
-        node4 = tree.nodes.new(FacadeInstanceNode.bl_idname)
+        node4 = tree.nodes.new(BuildingStyleNode.bl_idname)
         tree.links.new(node2.inputs[2], node1.outputs[0])
         tree.links.new(node3.inputs[1], node2.outputs[0])
         tree.links.new(node4.inputs[0], node3.outputs[0])
@@ -1769,10 +1863,13 @@ class FacadeFace:
         self.size: Vector = Vector((xy_size, dist_vec.z))
         self.start: Vector = left_loop.vert.co
         self.direction: Vector = (dist_vec * Vector((1, 1, 0))).normalized()
-        self.normal = left_loop.face.normal
-        self.floors_stack: FloorsStack = FloorsStack(template and template.floors_stack.floors[0].index)
+        self.normal: Vector = left_loop.face.normal
+        self.material_ind: int = left_loop.face.material_index
+        first_index = template.floors_stack.floors[0].index if template is not None and template.floors_stack.floors else None
+        self.floors_stack: FloorsStack = FloorsStack(first_index)
         self.position: set[Literal['LEFT', 'RIGHT', 'TOP']] = pos
         self.template_floors = template
+        self.face: BMFace = left_loop.face
 
         self.azimuth = None
 
@@ -1826,14 +1923,13 @@ class Facade:
 
 
 class Building:
-    def __init__(self, start_level: float, end_level: float):
+    def __init__(self, start_level: float):
         bm = bmesh.new()
         self.norm_lay = bm.verts.layers.float_vector.new("Normal")
         self.scale_lay = bm.verts.layers.float_vector.new("Scale")
         self.ind_lay = bm.verts.layers.int.new("Wall index")
         self.bm: bmesh.types.BMesh = bm
         self.start_level: float = start_level
-        self.end_level: float = end_level
 
         self.cur_facade: Facade = None
         self.cur_facade_face: FacadeFace = None
