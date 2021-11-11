@@ -11,6 +11,7 @@ from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal
 
 import bmesh
 import bpy
+import numpy as np
 from bmesh.types import BMEdge, BMFace, BMLoop, BMVert
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, BoolProperty, EnumProperty
@@ -54,6 +55,7 @@ class BuildingStyleTree(NodeTree):
         else:
             bm = bmesh.new()
             bm.from_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
         obj_fac_names = [names.obj_facade_name for names in obj_props.facade_names_mapping]
         points_bm = self.get_points(bm, obj_fac_names)
         points_bm.to_mesh(obj_props.points.data)
@@ -1977,6 +1979,64 @@ class Building:
         return mesh_loop
 
 
+class CentredMeshGrid:
+    """      Y
+    row 1    ↑  +-----+-----+
+             │  │     │     │
+    row 0       +-----+-----+
+                │     │     │
+    row -1      +-----+-----+   --→ X
+           col-1   col 0   col 1
+
+    >>> gr = CentredMeshGrid()
+    >>> gr.add(Vector((0, 0)), Vector((1., 1.)), 0)
+    >>> gr.add(Vector((1, 0)), Vector((2., 1.)), 1)
+    >>> gr.add(Vector((0, 1)), Vector((1., 3.)), 2)
+    >>> gr.clean_grid()
+    >>> gr._grid
+    array([[ 0,  1],
+           [ 2, -1]])
+    >>> gr._size_x
+    array([1., 2.])
+    >>> gr._size_y
+    array([1., 3.])
+    >>> [fi for fi in gr]
+    [0, 1, 2]
+    """
+    def __init__(self):
+        self._grid = np.full((100, 100), -1)
+        self._size_x = np.full(100, -1.0)
+        self._size_y = np.full(100, -1.0)
+
+        self._center_row = 50
+        self._center_col = 50
+
+    def add(self, cord: Vector, size: Vector, face_ind: int):
+        grid_pos = self._to_ind(cord)
+        self._grid[grid_pos] = face_ind
+        self._size_x[grid_pos[1]] = size.x
+        self._size_y[grid_pos[0]] = size.y
+
+    def clean_grid(self):
+        self._size_x = self._size_x[np.any(self._grid != -1, 0)]
+        self._size_y = self._size_y[np.any(self._grid != -1, 1)]
+        self._grid = self._grid[..., np.any(self._grid != -1, 0)][np.any(self._grid != -1, 1), ...]
+
+    def _to_ind(self, coord: Vector) -> tuple[int, int]:
+        return self._center_row + int(coord.y), self._center_col + int(coord.x)
+
+    def __iter__(self):
+        def face_indexes() -> Iterable[int]:
+            for row in self._grid:
+                for face_ind in row:
+                    if face_ind != -1:
+                        yield face_ind
+        return face_indexes()
+
+    def __repr__(self):
+        return repr(self._grid[::-1])
+
+
 class Geometry:
     def __init__(self, verts: list = None):
         self.verts = verts
@@ -2095,6 +2155,61 @@ class Geometry:
                 break
             yield next_direction_loop
             prev_loop = next_direction_loop
+
+    @staticmethod
+    def connected_coplanar_faces(start_face: BMFace) -> CentredMeshGrid:
+        def is_radial_face_valid(n_loop) -> bool:
+            _current_face = n_loop.face
+            _next_face = n_loop.link_loop_radial_next.face
+            if _next_face == face or _next_face in visited:  # last condition does not protect entirely
+                pass
+            elif len(_next_face.edges) != 4:
+                pass
+            elif isclose(n_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
+                return True
+            return False
+
+        gr = CentredMeshGrid()
+        left_loop, right_loop = Geometry.get_bounding_loops(start_face)
+        if len(start_face.verts) != 4:
+            xy_size = ((right_loop.vert.co - left_loop.vert.co) * Vector((1, 1, 0))).length
+            z_size = (right_loop.vert.co - left_loop.vert.co).z
+            gr.add(Vector((0, 0)), Vector((xy_size, z_size)), start_face.index)
+            gr.clean_grid()
+            return gr
+        visited: set[BMFace] = set()
+        next_faces: list[tuple[tuple[BMLoop, BMLoop], Vector]] = [((left_loop, right_loop), Vector((0, 0)))]
+        while next_faces:
+            (left_loop, right_loop), pos = next_faces.pop()
+            face = left_loop.face
+            if face in visited:
+                continue
+            face_size = Vector((left_loop.edge.calc_length(), right_loop.link_loop_prev.edge.calc_length()))
+            gr.add(pos, face_size, face.index)
+            visited.add(face)
+
+            # face below
+            if is_radial_face_valid(left_loop):
+                left_next = left_loop.link_loop_radial_next.link_loop_next.link_loop_next
+                right_next = left_loop.link_loop_radial_next
+                next_faces.append(((left_next, right_next), pos + Vector((0, -1))))
+            # face right
+            if is_radial_face_valid(left_loop.link_loop_next):
+                left_next = left_loop.link_loop_next.link_loop_radial_next.link_loop_next
+                right_next = left_next.link_loop_next.link_loop_next
+                next_faces.append(((left_next, right_next), pos + Vector((1, 0))))
+            # face up
+            if is_radial_face_valid(right_loop):
+                left_next = right_loop.link_loop_radial_next
+                right_next = left_next.link_loop_next.link_loop_next
+                next_faces.append(((left_next, right_next), pos + Vector((0, 1))))
+            # face left
+            if is_radial_face_valid(right_loop.link_loop_next):
+                left_next = right_loop.link_loop_next.link_loop_radial_next.link_loop_next
+                right_next = left_next.link_loop_next.link_loop_next
+                next_faces.append(((left_next, right_next), pos + Vector((-1, 0))))
+        gr.clean_grid()
+        return gr
 
 
 def update_tree_timer():
