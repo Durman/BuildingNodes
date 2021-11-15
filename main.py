@@ -1,18 +1,20 @@
+import bisect
 import inspect
 import random
 import sys
 import traceback
+from abc import ABC, abstractmethod
 from collections import namedtuple, defaultdict, deque
 from enum import Enum, auto
 from graphlib import TopologicalSorter
-from itertools import count, chain, cycle, repeat
-from math import isclose
-from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any
+from itertools import count, chain, cycle, repeat, accumulate
+from math import isclose, inf
+from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any, Union, overload, Generic, TypeVar
 
 import bmesh
 import bpy
 import numpy as np
-from bmesh.types import BMEdge, BMFace, BMLoop, BMVert
+from bmesh.types import BMEdge, BMFace, BMLoop, BMVert, BMesh
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, BoolProperty, EnumProperty
 from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
@@ -83,28 +85,30 @@ class BuildingStyleTree(NodeTree):
                 else:
                     in_data[to_sock.identifier] = None
 
-            if node.bl_idname == BuildingStyleNode.bl_idname:
-                return node.execute(node.gen_input_mapping()(*in_data.values()), base_bm, obj_facade_names)
+            is_last_node = node.bl_idname == BuildingStyleNode.bl_idname
+            # collect properties
+            if is_last_node:
+                props = base_bm
+            elif node.props_template:
+                props = node.props_template
+            elif hasattr(node, 'Props'):
+                props = node.Props(*[getattr(node, n) for n in node.Props._fields])
             else:
-                # collect properties
-                if node.props_template:
-                    props = node.props_template
-                elif hasattr(node, 'Props'):
-                    props = node.Props(*[getattr(node, n) for n in node.Props._fields])
-                else:
-                    props = None
+                props = None
 
-                # find inputs mapping
-                if node.input_template:  # this says that sockets have appropriate identifiers
-                    input_data = node.Inputs(*[in_data[key] for key in node.Inputs._fields])  # key words
-                else:  # positional
-                    input_data = (Inp := node.gen_input_mapping()) and Inp(*in_data.values())
+            # find inputs mapping
+            if node.input_template:  # this says that sockets have appropriate identifiers
+                input_data = node.Inputs(*[in_data[key] for key in node.Inputs._fields])  # key words
+            else:  # positional
+                input_data = (Inp := node.gen_input_mapping()) and Inp(*in_data.values())
 
-                res = node.execute(input_data, props)
-                if not isinstance(res, tuple):
-                    res = (res, )
-                for data, out_sok in zip(res, node.outputs):
-                    sock_data[out_sok] = data
+            res = node.execute(input_data, props)
+            if is_last_node:
+                return res
+            if not isinstance(res, tuple):
+                res = (res, )
+            for data, out_sok in zip(res, node.outputs):
+                sock_data[out_sok] = data
 
     def _get_points(self, base_bm: bmesh.types.BMesh):
         bm = bmesh.new()
@@ -249,7 +253,9 @@ class BaseSocket:
         if self.is_deprecated:
             row = layout.row()
             row.alert = True
-            row.label(text=f'{self.user_name or text or self.default_name} (deprecated)')
+            value = self.value if hasattr(self, 'value') else ''
+            value_name = value.name if hasattr(value, 'name') else value
+            row.label(text=f'{value_name or self.user_name or text or self.default_name} (deprecated)')
             row.operator(EditSocketsOperator.bl_idname, text='', icon='REMOVE').operation = 'delete'
 
         elif hasattr(self, 'value') and not self.is_output and not self.is_linked:
@@ -493,52 +499,16 @@ class BuildingStyleNode(BaseNode, Node):
     bl_idname = 'bn_BuildingStyleNode'
     bl_label = "Building Style"
     category = Categories.BUILDING
-    Inputs = namedtuple('Inputs', ['facade', 'facade0', 'facade1', 'facade2'])
-
-    edit_sockets: bpy.props.BoolProperty(name='Edit')
-
-    def node_init(self):
-        self.inputs.new(FacadeSocket.bl_idname, "Fill")
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, 'edit_sockets', toggle=1)
+    Inputs = namedtuple('Inputs', ['facade'])
+    input_template = Inputs(SocketTemplate(FacadeSocket))
 
     @staticmethod
-    def execute(inputs: Inputs, base_bm: bmesh.types.BMesh, obj_facade_names: list[str]):
-        build = Building(min(v.co.z for v in base_bm.verts))
-        input_ind = {'': 0}
-        for i, obj_f_name in enumerate(obj_facade_names, start=1):
-            if obj_f_name != '':
-                input_ind[obj_f_name] = i
-
-        f_lay = base_bm.faces.layers.string.get(FACE_STYLE_LAYER_NAME) \
-                or base_bm.faces.layers.string.new(FACE_STYLE_LAYER_NAME)
-        wall_lay = base_bm.faces.layers.int.get("Is wall") or base_bm.faces.layers.int.new("Is wall")
-
-        visited = set()
-        for face in base_bm.faces:
-            if face in visited:
-                continue
-            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
-            is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
-            facade_name = face[f_lay].decode()
-            facade_func = inputs[ind] if (ind := input_ind.get(facade_name, 0)) < len(inputs) else inputs[0]
-            if is_valid and facade_func:
-
-                face_loops = build.get_floor_polygons(face)
-                build.cur_facade = Facade(face_loops)
-
-                for facade_face in build.cur_facade.facade_faces_stack.facade_face_inter(build):
-                    visited.add(facade_face.face)
-                    build.cur_facade_face = facade_face
-                    if facade_func(build):
-                        facade_face.face[wall_lay] = 1
-                    else:
-                        facade_face.face[wall_lay] = 0
-
-            else:
-                face[wall_lay] = 0
-
+    def execute(inputs: Inputs, base_bm: bmesh.types.BMesh):
+        build = Building(base_bm)
+        if inputs.facade:
+            for facade in build.facades:
+                if inputs.facade(facade):
+                    facade.do_instance(build)
         return build.bm
 
 
@@ -586,11 +556,11 @@ class PanelNode(BaseNode, Node):
     def execute(inputs: Inputs, props: Props):
         size_v_catch = None
 
-        def panel_gen(build: Building):
+        def panel_gen(facade: Facade):
             # panel is expected to be in XY orientation
             nonlocal size_v_catch
             if size_v_catch is None:
-                obj = inputs.object(build)
+                obj = inputs.object(facade)
                 if obj is None:
                     return None
                 if obj.mode == 'EDIT':
@@ -605,8 +575,8 @@ class PanelNode(BaseNode, Node):
                 max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts)))
                 size_v_catch = max_v - min_v
             panel = Panel(props.panel_index, size_v_catch)
-            panel.probability = inputs.probability(build)
-            panel.set_scope_padding(inputs.scope_padding(build))  # for now it works only as scale
+            panel.probability = inputs.probability(facade)
+            panel.set_scope_padding(inputs.scope_padding(facade))  # for now it works only as scale
             return panel
         return panel_gen
 
@@ -621,8 +591,8 @@ class PanelAttributesNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs, props):
-        def panel_index(build: Building):
-            return build.cur_facade.cur_panel_ind
+        def panel_index(facade: Facade):
+            return facade.cur_panel_ind
         return panel_index
 
 
@@ -734,12 +704,12 @@ class PanelRandomizeNode(BaseNode, Node):
     def execute(inputs: Inputs, params):
         random_streams = dict()
 
-        def randomize_panels(build: Building):
-            stream = random_streams.get(build.cur_facade.cur_floor_ind)
+        def randomize_panels(facade: Facade):
+            stream = random_streams.get(facade.cur_floor_ind)
             if stream is None:
-                stream = random.Random(int(inputs.seed(build)))
-                random_streams[build.cur_facade.cur_floor_ind] = stream
-            panels = [p for inp in inputs[1: -1] if (p := inp(build)) is not None]
+                stream = random.Random(int(inputs.seed(facade)))
+                random_streams[facade.cur_floor_ind] = stream
+            panels = [p for inp in inputs[1: -1] if (p := inp(facade)) is not None]
             return stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
 
@@ -838,38 +808,48 @@ class FloorPatternNode(BaseNode, Node):
 
     @classmethod
     def execute(cls, inputs: Inputs, props: Props):
-        def floor_gen(build: Building, precompute=False):
-            if precompute:
-                floor = Floor(build.cur_facade.cur_floor_ind)
-                floor.height = inputs.height(build)
-                return floor
+        catch = None
 
-            floor = Floor(build.cur_facade.cur_floor_ind)
-            build.cur_floor = floor
+        def floor_gen(facade: Facade):
+            floor = facade.get_floor()
             pan_stack = floor.panels_stack
-            if "LEFT" in build.cur_facade_face.position and inputs.left:
-                pan_stack.add_panel(build, inputs.left, 'LEFT')
-            if 'RIGHT' in build.cur_facade_face.position and inputs.right:
-                pan_stack.add_panel(build, inputs.right, 'RIGHT')
-            if inputs.fill and not pan_stack.is_full(build):
-                for i in range(1000):
-                    panel = None
+            if inputs.left:
+                facade.cur_panel_ind = 0
+                panel = inputs.left(facade)
+                try:
+                    pan_stack.append(panel)
+                except IndexError:
+                    pass
+            if inputs.fill:
+                for _ in range(1000):
                     for _ in range(10):
-                        panel = pan_stack.add_panel(build, inputs.fill)
+                        facade.cur_panel_ind = len(pan_stack)
+                        panel = inputs.fill(facade)
                         if panel:
                             break
-                    if panel is None or pan_stack.is_full(build):
+                    if panel is None:
                         break
+                    try:
+                        pan_stack.append(panel)
+                    except IndexError:
+                        break
+            if inputs.right:
+                facade.cur_panel_ind = len(pan_stack) - 1
+                panel = inputs.right(facade)
+                replaced = pan_stack.replace(panel, DistSlice(pan_stack.max_width - panel.size.x, None))
+                if len(replaced) != 1:
+                    facade.cur_panel_ind = len(pan_stack) - len(replaced)
+                    panel = inputs.right(facade)
+                    pan_stack.replace(panel, DistSlice(pan_stack.max_width - panel.size.x, None))
 
-            if pan_stack.has_panels:
+            if pan_stack:
                 if props.use_height:
-                    floor.height = inputs.height(build)
+                    floor.height = inputs.height(facade)
                 else:
-                    floor.height = max((p.size.y for p in pan_stack.all_panels), default=0)
-                pan_stack.update_location_scale(build)
+                    floor.height = max((p.size.y for p in pan_stack), default=0)
+                pan_stack.fit_scale()
                 return floor
-            else:
-                return None
+
         return floor_gen
 
 
@@ -886,15 +866,15 @@ class FloorAttributesNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs, props):
-        def floor_width(build: Building):
-            return build.cur_facade.size.x
+        def floor_width(facade: Facade):
+            return facade.size.x
 
-        def floor_height(build: Building):
+        def floor_height(facade: Facade):
             return None
 
-        def floor_index(build: Building):
-            build.depth.add('floor_index')
-            return build.cur_facade.cur_floor_ind
+        def floor_index(facade: Facade):
+            facade.depth.add('floor_index')
+            return facade.cur_floor_ind
 
         return floor_width, floor_height, floor_index
 
@@ -915,52 +895,44 @@ class FloorSwitchNode(BaseNode, Node):
     def execute(inputs: Inputs, props):
         catch = dict()
         depth = set()
-        last_facade_face = None
+        last_facade = None
 
-        def switch_floor(build: Building, precompute=False):
-            if precompute:
-                if inputs.bool(build):
-                    if inputs.true_floor is not None:
-                        return inputs.true_floor(build, precompute=precompute)
-                else:
-                    if inputs.false_floor is not None:
-                        return inputs.false_floor(build, precompute=precompute)
-
+        def switch_floor(facade: Facade):
             if inputs.bool is None:
                 return
-            nonlocal last_facade_face
-            if build.cur_facade_face != last_facade_face:  # the catch should exist per facade face
-                last_facade_face = build.cur_facade_face
+            nonlocal last_facade
+            if facade != last_facade:  # the catch should exist per facade
+                last_facade = facade
                 catch.clear()
                 depth.clear()
             switch_state = None
             if inputs.bool not in catch:
-                build.depth.clear()
-                switch_state = inputs.bool(build)
-                catch[inputs.bool] = None if build.depth else switch_state
-                depth.update(build.depth)
-            return_true = switch_state or catch[inputs.bool] or inputs.bool(build)
+                facade.depth.clear()
+                switch_state = inputs.bool(facade)
+                catch[inputs.bool] = None if facade.depth else switch_state
+                depth.update(facade.depth)
+            return_true = switch_state or catch[inputs.bool] or inputs.bool(facade)
             if return_true:
                 if inputs.true_floor:
                     true_floor = None
                     if inputs.true_floor not in catch:
-                        build.depth.clear()
-                        true_floor = inputs.true_floor(build)
-                        catch[inputs.true_floor] = None if build.depth else true_floor
-                        depth.update(build.depth)
-                    build.depth = depth.copy()
-                    floor = true_floor or catch[inputs.true_floor] or inputs.true_floor(build)
+                        facade.depth.clear()
+                        true_floor = inputs.true_floor(facade)
+                        catch[inputs.true_floor] = None if facade.depth else true_floor
+                        depth.update(facade.depth)
+                    facade.depth = depth.copy()
+                    floor = true_floor or catch[inputs.true_floor] or inputs.true_floor(facade)
                     return floor
             else:
                 if inputs.false_floor:
                     false_floor = None
                     if inputs.false_floor not in catch:
-                        build.depth.clear()
-                        false_floor = inputs.false_floor(build)
-                        catch[inputs.false_floor] = None if build.depth else false_floor
-                        depth.update(build.depth)
-                    build.depth = depth.copy()
-                    floor = false_floor or catch[inputs.false_floor] or inputs.false_floor(build)
+                        facade.depth.clear()
+                        false_floor = inputs.false_floor(facade)
+                        catch[inputs.false_floor] = None if facade.depth else false_floor
+                        depth.update(facade.depth)
+                    facade.depth = depth.copy()
+                    floor = false_floor or catch[inputs.false_floor] or inputs.false_floor(facade)
                     return floor
 
         return switch_floor
@@ -1001,66 +973,38 @@ class FacadePatternNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs: Inputs, params):
-        def facade_generator(build: Building):
-            facade_face = build.cur_facade_face
-            floors_stack = facade_face.floors_stack
-            # searching first floor index
-            if floors_stack.first_index is None:
-                is_fill_fixed = False
-                floors_stack.first_index = 0
-                start_height = facade_face.start.z - build.start_level
-                if not isclose(start_height, 0, abs_tol=0.1):
-                    if inputs.first:
-                        floors_stack.add_floor(build, inputs.first, mockup=True)
-                    if inputs.fill:
-                        for i in range(10000):
-                            if floors_stack.is_full(start_height):
-                                break
-                            if not is_fill_fixed:
-                                floor = None
-                                for _ in range(10):
-                                    floor = floors_stack.add_floor(build, inputs.fill, mockup=True)
-                                    if floor:
-                                        break
-                                if floor is None:
-                                    break
-                                is_fill_fixed = not build.depth
-                            else:
-                                floors_stack.repeat_last()
-                    start_index = len(floors_stack.floors)
-                    floors_stack.clear(start_index)
+        def facade_generator(facade: Facade):
+            floors_stack = facade.floors_stack
 
             # generate floors
-            is_fill_fixed = False
-            if inputs.first and floors_stack.first_index == 0:
-                floors_stack.add_floor(build, inputs.first)
+            if inputs.first:
+                facade.cur_floor_ind = len(facade.floors_stack)
+                floor = inputs.first(facade)
+                floors_stack.append(floor)
             if inputs.fill:
                 for i in range(10000):
-                    if inputs.last and 'TOP' in build.cur_facade_face.position:
-                        if floors_stack.will_be_last_floor(build, inputs.last, build.cur_facade.size.y):
-                            floors_stack.add_floor(build, inputs.last)
+                    for _ in range(10):
+                        facade.cur_floor_ind = len(facade.floors_stack)
+                        floor = inputs.fill(facade)
+                        if floor:
                             break
-                    else:
-                        if floors_stack.is_full(build.cur_facade.size.y):
-                            break
+                    if floor is None:
+                        break
+                    try:
+                        floors_stack.append(floor)
+                    except IndexError:
+                        break
+            if inputs.last:
+                facade.cur_floor_ind = len(facade.floors_stack) - 1
+                floor = inputs.last(facade)
+                replaced = floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
+                if replaced != 1:
+                    facade.cur_floor_ind = len(facade.floors_stack) - len(replaced)
+                    floor = inputs.last(facade)
+                    floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
 
-                    if not is_fill_fixed:
-                        floor = None
-                        for _ in range(10):
-                            floor = floors_stack.add_floor(build, inputs.fill)
-                            if floor:
-                                break
-                        if floor is None:
-                            break
-                        is_fill_fixed = not build.depth
-                    else:
-                        floors_stack.repeat_last()
-            elif inputs.last and 'TOP' in build.cur_facade_face.position\
-                    and not floors_stack.is_full(build.cur_facade.size.y):
-                floors_stack.add_floor(build, inputs.last)
-
-            if facade_face:
-                floors_stack.instance_floors(build, inputs.fill or floors_stack.is_full(build.cur_facade.size.y))
+            if floors_stack:
+                floors_stack.fit_scale()
                 return True
             else:
                 return False
@@ -1480,9 +1424,9 @@ class AddNewBuildingStyleOperator(Operator):
         obj_props: ObjectProperties = obj.building_props
         tree = bpy.data.node_groups.new("BuildingStyle", BuildingStyleTree.bl_idname)
         node1 = tree.nodes.new(PanelNode.bl_idname)
-        node2 = tree.nodes.new(FloorPatternNode.bl_idname)
-        node3 = tree.nodes.new(FacadePatternNode.bl_idname)
-        node4 = tree.nodes.new(BuildingStyleNode.bl_idname)
+        node2: Node = tree.nodes.new(FloorPatternNode.bl_idname)
+        node3: Node = tree.nodes.new(FacadePatternNode.bl_idname)
+        node4: Node = tree.nodes.new(BuildingStyleNode.bl_idname)
         tree.links.new(node2.inputs[2], node1.outputs[0])
         tree.links.new(node3.inputs[1], node2.outputs[0])
         tree.links.new(node4.inputs[0], node3.outputs[0])
@@ -1676,7 +1620,7 @@ class EditPanelAttributesOperator(Operator):
             for vert in bm.verts:
                 vert[sc_lay] = vert.select
             points = [v for v in bm.verts if v[sc_lay]] or bm.verts
-            center = Geometry(points).get_bounding_center()
+            center = Geometry.get_bounding_center(points)
             glob_center = center * obj.scale
             glob_center.rotate(obj.rotation_euler)
             obj.location += glob_center
@@ -1706,238 +1650,324 @@ for name, member in inspect.getmembers(sys.modules[__name__]):
             classes[member] = None
 
 
-class Panel:
+class DistSlice:
+    def __init__(self, start: float = None, stop: float = None):
+        if start is None and stop is None:
+            raise TypeError('Distance slice should either start or stop limit')
+        self.start: Optional[float] = start
+        self.stop: Optional[float] = stop
+
+    @property
+    def length(self):
+        return self.stop - self.start
+
+    def __repr__(self):
+        start = self.start.__format__('.2f') if self.start is not None else None
+        stop = self.stop.__format__('.2f') if self.stop is not None else None
+        return f"<DistSlice({start}, {stop})>"
+
+
+class Shape(ABC):
+    @property
+    @abstractmethod
+    def stack_size(self):
+        ...
+
+    @abstractmethod
+    def scale_along_stack(self, factor: float):
+        ...
+
+
+class Panel(Shape):
     def __init__(self, obj_index: int, size: Vector):
         # panel is expected to be in XY orientation
         self.obj_index = obj_index  # index of object in the collection
         self.size: Vector = size
-        self.location: Vector = None
         self.scale: Vector = Vector((1, 1))
 
+        # user attributes
         self.probability = 1
 
     @property
-    def instance_size(self) -> Vector:
-        return self.size * self.scale
+    def stack_size(self):
+        return self.size.x * self.scale.x
+
+    def scale_along_stack(self, factor: float):
+        self.scale *= Vector((factor, 1))
 
     def set_scope_padding(self, padding):
         self.size.x += padding[0] + padding[2]
         self.size.y += padding[1] + padding[3]
 
-    def instance(self, build, floor_level: float, floor_scale: float):
-        facade_face = build.cur_facade_face
-        vec = build.bm.verts.new(self.location + Vector((0, 0, floor_level)))
-        vec[build.norm_lay] = facade_face.normal
-        vec[build.scale_lay] = (self.scale.x, self.scale.y * floor_scale, 1)
+    def do_instance(self, build: 'Building', location: Vector, scale: Vector, normal: Vector):
+        vec = build.bm.verts.new(location)
+        vec[build.norm_lay] = normal
+        vec[build.scale_lay] = (*(self.scale * scale), 1)
         vec[build.ind_lay] = self.obj_index
 
     def __repr__(self):
-        return f"<Panel:{self.obj_index}, loc=({self.location.x:.2f}, {self.location.y:.2f})>"
+        return f"<Panel:{self.obj_index}>"
 
 
-class PanelsStack:
-    def __init__(self):
-        self._left_panel = []
-        self._panels = []
-        self._right_panel = []
-        self._stack_width = 0
-
-    def add_panel(self, build, panel_f, p_type: Literal['LEFT', 'FILL', 'RIGHT'] = 'FILL'):
-        build.cur_facade.cur_panel_ind = len(self._panels) if p_type == 'FILL' else 0
-        panel: Panel = panel_f(build)
-        self._stack_width += panel and panel.size.x or 0
-        if p_type == 'FILL':
-            self._panels.append(panel)
-        elif p_type == 'LEFT':
-            self._left_panel.append(panel)
-        elif p_type == 'RIGHT':
-            self._right_panel.append(panel)
-        return panel
-
-    def is_full(self, build):
-        return self._stack_width > build.cur_facade_face.size.x
-
-    def update_location_scale(self, build):
-        if not self.has_panels:
-            return
-        facade_face = build.cur_facade_face
-        xy_scale = build.cur_facade_face.size.x / self._stack_width
-        xy_shift = 0
-        for panel in (p for p in self.all_panels if p):
-            z_scale = build.cur_floor.height / panel.size.y
-            panel.scale *= Vector((xy_scale, z_scale))
-            size = panel.instance_size.x
-            xy_shift += size / 2
-            panel.location = facade_face.start + facade_face.direction * xy_shift
-            xy_shift += size / 2
-
-    @property
-    def has_panels(self) -> bool:
-        return any(self.all_panels)
-
-    @property
-    def all_panels(self) -> Iterable[Panel]:
-        return (p for p in chain(self._left_panel, self._panels, self._right_panel) if p is not None)
-
-    def __repr__(self):
-        str_panels = ', '.join(str(p) for p in chain([self._left_panel], self._panels, [self._right_panel]) if p)
-        return f"[{str_panels}]"
-
-
-class Floor:
-    def __init__(self, index=None):
-        self.index = index
+class Floor(Shape):
+    def __init__(self, facade: 'Facade'):
+        self.index = facade.cur_floor_ind
         self.height = None
         self.z_level = None
-        self.z_scale = None
-        self.panels_stack: PanelsStack = PanelsStack()
+        self.z_scale = 1
+        self.panels_stack: ShapesStack[Panel] = ShapesStack(facade.size.x)
 
-    def instance_panels(self, build):
-        for panel in self.panels_stack.all_panels:
-            panel.instance(build, self.z_level, self.z_scale)
+    @property
+    def stack_size(self):
+        return self.height * self.z_scale
+
+    def scale_along_stack(self, factor: float):
+        self.z_scale *= factor
+
+    def do_instance(self, build: 'Building', start: Vector, direction: Vector, normal: Vector, panels_range: DistSlice,
+                    z_factor):
+        """    +--+--+--+   3D
+        start  *  │  │  │
+               +--+--+--+--------→ direction
+        """
+        xy_shift = 0
+        panels = self.panels_stack[panels_range]
+        xy_factor = panels_range.length / sum(p.stack_size for p in panels)
+        for panel in panels:
+            size_x = panel.stack_size * xy_factor
+            z_scale = self.stack_size / panel.size.y * z_factor
+            xy_shift += size_x / 2
+            panel.do_instance(build, start + direction * xy_shift, Vector((xy_factor, z_scale)), normal)
+            xy_shift += size_x / 2
 
     def __repr__(self):
         return f"<Floor i={self.index}, {self.panels_stack}>"
 
 
-class FloorsStack:
-    def __init__(self, first_index=None):
-        self.floors: list[Optional[Floor]] = []
-        self._current_height = 0
-        self._last_ind = first_index
+ShapeType = TypeVar('ShapeType')
 
-    def clear(self, new_first_index=None):
-        self.floors.clear()
-        self._current_height = 0
-        self._last_ind = new_first_index
+
+class ShapesStack(Generic[ShapeType]):
+    """Before replacing or adding new element it remove panels from right side if the size of the stack is too big"""
+    def __init__(self, max_width):
+        self._shapes: list[Shape] = []
+        self._cum_width: list[float] = [0]
+        self.max_width = max_width
+
+    def append(self, shape: Shape):
+        if self.can_be_added(shape):
+            self._cum_width.append(self._cum_width[-1] + (shape and shape.stack_size or 0))
+            self._shapes.append(shape)
+        else:
+            raise IndexError("Given shape is too big or shape stuck is full")
+
+    def replace(self, shape: Shape, position: DistSlice) -> list[Shape]:
+        replace_ind = self._range_to_indexes(position)
+        removed_panels = self[replace_ind]
+        self[replace_ind] = shape
+        return removed_panels
 
     @property
-    def first_index(self):
-        return self._last_ind
+    def is_full(self):
+        return self._cum_width[-1] > self.max_width
 
-    @first_index.setter
-    def first_index(self, value):
-        self._last_ind = value
+    @property
+    def width(self):
+        return self._cum_width[-1]
 
-    def add_floor(self, build, floor_f, mockup=False) -> Optional[Floor]:
-        build.cur_facade.cur_floor_ind = self._last_ind
-        floor = floor_f(build, precompute=mockup)
-        self.floors.append(floor)
-        self._last_ind += 1
-        self._current_height += floor.height if floor else 0
-        return floor
+    def fit_scale(self):
+        scale = self.max_width / self.width
+        for shape in self._shapes:
+            shape.scale_along_stack(scale)
+        self._cum_width = list(accumulate((p.stack_size for p in self._shapes), initial=0))
 
-    def repeat_last(self):
-        self.floors.append(self.floors[-1])
-        self._current_height += last_floor.height if (last_floor := self.floors[-1]) else 0
-        self._last_ind += 1
+    def can_be_added(self, shape: Shape) -> bool:
+        """               │←-→│ the scale distance if the shape will be added
+        +-------+------+------+-----
+        │ *     │ *    │  new │
+                          │
+                          │
+                       │←→│     the scale distance if the shape won't be added
+        +-------+------+------  in this case the panel should not be added
+        │ *     │ *    │
+        """
+        cur_scale_dist = abs(self.max_width - self.width)
+        new_scale_dist = abs(self.width + shape.stack_size - self.max_width)
+        return new_scale_dist < cur_scale_dist
 
-    def will_be_last_floor(self, build, floor_f, height) -> Optional[bool]:
-        build.cur_facade.cur_floor_ind = self._last_ind
-        floor = floor_f(build, precompute=True)
-        return height < (self._current_height + (floor and floor.height or 0))
+    def copy_range(self, dist_range: DistSlice) -> 'ShapesStack':
+        stack = ShapesStack(None)
+        panels_range = self._range_to_indexes(dist_range)
+        stack._shapes = self._shapes[panels_range]
+        stack._cum_width = self._cum_width[panels_range.start: panels_range.stop + 2]
+        stack._cum_width -= dist_range.start
+        return stack
 
-    def is_full(self, height: float):
-        return height < self._current_height
+    def _range_to_indexes(self, dist_range: DistSlice) -> slice:
+        """
+        slice      0 1   2  3   4  5     6
+        sh_index    0  1  2   3  4    5
+        width -     1  3  2   3  2    5
+        shapes     +-+---+--+---+--+-----+-----------
+        in stack   │ │   │  │   │  │     │
+                   +-+---+--+---+--+-----+-----------
+        cum_width  0 1   4  6   9  11    16
+        slice     0 1  2   3  4   5    6    7
+        """
+        if dist_range.start is None:
+            left_shape_ind = None
+        else:
+            left_shape_ind = bisect.bisect(self._cum_width, dist_range.start) - 1
+            is_first_shape = left_shape_ind == -1
+            before_dist = inf if is_first_shape else dist_range.start - self._cum_width[left_shape_ind]
+            is_last_shape = left_shape_ind == len(self._cum_width) - 1
+            after_dist = inf if is_last_shape else self._cum_width[left_shape_ind + 1] - dist_range.start
+            if before_dist > after_dist:
+                left_shape_ind += 1
+        if dist_range.stop is None:
+            right_shape_ind = None
+        else:
+            right_shape_ind = bisect.bisect(self._cum_width, dist_range.stop) - 1
+            is_first_shape = right_shape_ind == -1
+            before_dist = inf if is_first_shape else dist_range.stop - self._cum_width[right_shape_ind]
+            is_last_shape = right_shape_ind == len(self._cum_width) - 1
+            after_dist = inf if is_last_shape else self._cum_width[right_shape_ind + 1] - dist_range.stop
+            if before_dist > after_dist:
+                right_shape_ind += 1
+        return slice(left_shape_ind, right_shape_ind)
 
-    def instance_floors(self, build, is_to_scale):
-        z_scale = (build.cur_facade_face.size.y / self._current_height) if self._current_height and is_to_scale else 1
-        real_floors_height = 0
-        for floor in self.floors:
-            if not floor:
-                continue
-            height = floor.height * z_scale
-            floor.z_level = real_floors_height + height / 2
-            floor.z_scale = z_scale
-            floor.instance_panels(build)
-            real_floors_height += height
+    @overload
+    def __getitem__(self, key: int) -> ShapeType: ...
+    @overload
+    def __getitem__(self, key: slice) -> list[ShapeType]: ...
+    @overload
+    def __getitem__(self, key: DistSlice) -> list[ShapeType]: ...
 
-    def __repr__(self):
-        floors = '\n'.join(repr(f) for f in reversed(self.floors))
-        return f"[{floors}]"
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._shapes[key]
+        if isinstance(key, DistSlice):
+            return self._shapes[self._range_to_indexes(key)]
+        raise TypeError
 
+    def __setitem__(self, key, shape: Shape):
+        if isinstance(key, int):
+            index = key
+            old_panel_size = self._cum_width[index + 1] - self._cum_width[index]
+            new_panel_size = shape.stack_size
+            impact_size = new_panel_size - old_panel_size
+            self._shapes[index] = shape
+            self._cum_width = [self._cum_width[:index + 1]] + [old_s + impact_size for old_s in
+                                                               self._cum_width[index + 1:]]
+        elif isinstance(key, slice):
+            start = key.start if key.start is not None else 0
+            stop = key.stop if key.stop is not None else len(self._shapes)
+            old_shapes_size = sum(s - s_prev for s, s_prev in zip(
+                self._cum_width[start + 1: stop + 1], self._cum_width[start: stop]))
+            impact_size = shape.stack_size - old_shapes_size
+            self._shapes[start: stop] = [shape]
+            self._cum_width[start + 1: stop + 1] = [self._cum_width[start] + shape.stack_size]
+            self._cum_width = self._cum_width[:start + 2] + [old_s + impact_size for old_s
+                                                                 in self._cum_width[start + 2:]]
+        else:
+            raise TypeError
 
-class FacadeFace:
-    def __init__(self, left_loop, right_loop, pos: set[Literal['LEFT', 'RIGHT', 'TOP']], template: 'FacadeFace' = None):
-        dist_vec = right_loop.vert.co - left_loop.vert.co
-        xy_size = (dist_vec * Vector((1, 1, 0))).length
-
-        self.size: Vector = Vector((xy_size, dist_vec.z))
-        self.start: Vector = left_loop.vert.co
-        self.direction: Vector = (dist_vec * Vector((1, 1, 0))).normalized()
-        self.normal: Vector = left_loop.face.normal
-        self.material_ind: int = left_loop.face.material_index
-        first_index = template.floors_stack.floors[0].index if template is not None and template.floors_stack.floors else None
-        self.floors_stack: FloorsStack = FloorsStack(first_index)
-        self.position: set[Literal['LEFT', 'RIGHT', 'TOP']] = pos
-        self.template_floors = template
-        self.face: BMFace = left_loop.face
-
-        self.azimuth = None
-
-    def __repr__(self):
-        return f"<FFace {self.floors_stack}>"
+    def __len__(self):
+        return len(self._shapes)
 
     def __bool__(self):
-        return bool(self.floors_stack.floors)
+        return bool(self._shapes)
 
+    def __iter__(self) -> Iterable[ShapeType]:
+        return iter(self._shapes)
 
-class FacadeFacesStack:
-    def __init__(self, face_loops: list[tuple[BMLoop, BMLoop]]):
-        self._corner_loops_stack: list[tuple[BMLoop, BMLoop]] = face_loops
-        self._size: Vector = None
-
-    @property
-    def size(self) -> Vector:
-        if self._size is None:
-            xy_size = sum(((lr.vert.co - ll.vert.co) * Vector((1, 1, 0))).length for ll, lr in self._corner_loops_stack)
-            first_ll, first_lr = self._corner_loops_stack[0]
-            z_size = (first_lr.vert.co - first_ll.vert.co).z
-            size = Vector((xy_size, z_size))
-            self._size = size
-        return self._size
-
-    def facade_face_inter(self, build) -> Iterable[FacadeFace]:
-        positions = chain(['LEFT'], repeat(None, len(self._corner_loops_stack) - 2), ['RIGHT'])
-        prev_face = None
-        for (left_loop, right_loop), pos in zip(self._corner_loops_stack, positions):
-            pos = {pos} if pos else set()
-            if right_loop.edge.calc_face_angle(3.14) > 0.17:  # 10 degrees
-                pos.add('TOP')
-            facade_face = FacadeFace(left_loop, right_loop, pos, prev_face)
-            build.cur_facade_face = facade_face
-            yield facade_face
-            prev_face = facade_face
+    def __repr__(self):
+        str_panels = ', '.join(str(p) for p in self._shapes)
+        return f"[{str_panels}]"
 
 
 class Facade:
-    def __init__(self, face_loops: list[tuple[BMLoop, BMLoop]]):
-        self.cur_floor_ind = None
-        self.cur_panel_ind = None
-        self.facade_faces_stack: FacadeFacesStack = FacadeFacesStack(face_loops)
+    def __init__(self, grid: 'CentredMeshGrid'):
+        self.cur_floor: Floor = None
+        self.cur_floor_ind = None  # it's not always the last index in the floors stack
+        self.cur_panel_ind = None  # it's not always the last index in the panels stack
+        self.grid: CentredMeshGrid = grid
+        self.floors_stack: ShapesStack[Floor] = ShapesStack(grid.size.y)
 
-        self.left_wall_angle = face_loops[0][0].link_loop_prev.edge.calc_face_angle(3.14)
-        self.right_wall_angle = face_loops[-1][1].link_loop_prev.edge.calc_face_angle(3.14)
+        self.depth: set[Literal['floor_index']] = set()
+
+        self.left_wall_angle = None
+        self.right_wall_angle = None
 
     @property
     def size(self) -> Vector:
-        return self.facade_faces_stack.size
+        return self.grid.size
+
+    def get_floor(self) -> Floor:
+        floor = Floor(self)
+        self.cur_floor = floor
+        return floor
+
+    def do_instance(self, build: 'Building'):
+        """     ↑ direction 3D
+                +------------+
+                │  floor     │
+        start   *------------+-----→ Panels direction
+        """
+        for face_i, floors_pos, panel_pos in self.grid.cells_and_positions:
+            face = build._base_bm.faces[face_i]
+            start, max_l = Geometry.get_bounding_loops(face)
+            direction = Vector((0, 0, 1))
+            panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
+            z_shift = 0
+            floors = self.floors_stack[floors_pos]
+            z_factor = floors_pos.length / sum(f.stack_size for f in floors)
+            for floor in self.floors_stack[floors_pos]:
+                size = floor.stack_size * z_factor
+                z_shift += size / 2
+                floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal, panel_pos, z_factor)
+                z_shift += size / 2
+
+    def __repr__(self):
+        floors = '\n'.join([repr(floor) for floor in self.floors_stack[::-1]])
+        return f"<Facade: \n{floors}>"
 
 
 class Building:
-    def __init__(self, start_level: float):
+    def __init__(self, base_bm):
         bm = bmesh.new()
         self.norm_lay = bm.verts.layers.float_vector.new("Normal")
         self.scale_lay = bm.verts.layers.float_vector.new("Scale")
         self.ind_lay = bm.verts.layers.int.new("Wall index")
-        self.bm: bmesh.types.BMesh = bm
-        self.start_level: float = start_level
+        self.bm: BMesh = bm
 
         self.cur_facade: Facade = None
-        self.cur_facade_face: FacadeFace = None
-        self.cur_floor: Floor = None
 
-        self.depth: set[Literal['floor_index']] = set()
+        self._base_bm: BMesh = base_bm
+
+    @property
+    def facades(self) -> Iterable[Facade]:
+        wall_lay = self._base_bm.faces.layers.int.get("Is wall") or self._base_bm.faces.layers.int.new("Is wall")
+
+        visited = set()
+        for face in self._base_bm.faces:
+            if face in visited:
+                continue
+            is_vertical = isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1)
+            is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
+            if is_valid:
+
+                facade_grid = Geometry.connected_coplanar_faces(face)
+                facade = Facade(facade_grid)
+                self.cur_facade = facade
+                yield facade
+
+                for face_ind in facade_grid:
+                    _face = self._base_bm.faces[face_ind]
+                    visited.add(_face)
+                    _face[wall_lay] = 1
+            else:
+                face[wall_lay] = 0
 
     @staticmethod
     def calc_azimuth(vec: Vector):
@@ -1945,38 +1975,6 @@ class Building:
         north = Vector((0, 1, 0))
         is_right = vec.cross(north).normalized().z < 0
         return vec @ north + 3 if is_right else 1 - vec @ north
-
-    @staticmethod
-    def get_floor_polygons(base_face) -> deque[tuple[BMLoop, BMLoop]]:
-        visited: set[BMFace] = {base_face}  # protection from infinite mesh loop
-        mesh_loop: deque[tuple[BMLoop, BMLoop]] = deque()
-        left_loop, right_loop = Geometry.left_right_loops(base_face)
-        if len(base_face.verts) == 4:
-            mesh_loop.append((left_loop.link_loop_next, left_loop.link_loop_prev))
-        else:
-            mesh_loop.append(Geometry.get_bounding_loops(base_face))
-        # if faces are coplanar the angle is zero, with signed version the angle has `-` if angle is inside
-        if left_loop and isclose(left_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):  # 10 degrees
-            for next_left_loop in Geometry.mesh_loop_walk(left_loop):
-                face = next_left_loop.face
-                if face not in visited:
-                    visited.add(face)
-                else:
-                    break
-                mesh_loop.appendleft((next_left_loop.link_loop_next, next_left_loop.link_loop_prev))
-                if not isclose(next_left_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
-                    break
-        if right_loop and isclose(right_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
-            for next_right_loop in Geometry.mesh_loop_walk(right_loop):
-                face = next_right_loop.face
-                if face not in visited:
-                    visited.add(face)
-                else:
-                    break
-                mesh_loop.append((next_right_loop.link_loop_prev, next_right_loop.link_loop_next))
-                if not isclose(next_right_loop.edge.calc_face_angle(3.14), 0, abs_tol=0.17):
-                    break
-        return mesh_loop
 
 
 class CentredMeshGrid:
@@ -2002,6 +2000,10 @@ class CentredMeshGrid:
     array([1., 3.])
     >>> [fi for fi in gr]
     [0, 1, 2]
+    >>> print("\\n".join([str(i) for i in gr.cells_and_positions]))
+    (0, <DistSlice(0.00, 1.00)>, <DistSlice(0.00, 1.00)>)
+    (1, <DistSlice(0.00, 1.00)>, <DistSlice(1.00, 3.00)>)
+    (2, <DistSlice(1.00, 4.00)>, <DistSlice(0.00, 1.00)>)
     """
     def __init__(self):
         self._grid = np.full((100, 100), -1)
@@ -2022,6 +2024,20 @@ class CentredMeshGrid:
         self._size_y = self._size_y[np.any(self._grid != -1, 1)]
         self._grid = self._grid[..., np.any(self._grid != -1, 0)][np.any(self._grid != -1, 1), ...]
 
+    @property
+    def size(self) -> Vector:
+        return Vector((np.sum(self._size_x[self._size_x > 0]), np.sum(self._size_y[self._size_y > 0])))
+
+    @property
+    def cells_and_positions(self) -> Iterable[tuple[int, DistSlice, DistSlice]]:
+        cum_size_x = list(accumulate(self._size_x, initial=0))
+        cum_size_y = list(accumulate(self._size_y, initial=0))
+        for i_row, row in enumerate(self._grid):
+            for i_col, face_ind in enumerate(row):
+                if face_ind != -1:
+                    yield face_ind, DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]),\
+                          DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
+
     def _to_ind(self, coord: Vector) -> tuple[int, int]:
         return self._center_row + int(coord.y), self._center_col + int(coord.x)
 
@@ -2038,18 +2054,17 @@ class CentredMeshGrid:
 
 
 class Geometry:
-    def __init__(self, verts: list = None):
-        self.verts = verts
-
-    def get_bounding_verts(self) -> tuple[Vector, Vector]:  # min, max
-        min_v = Vector((min(v.co.x for v in self.verts), min(v.co.y for v in self.verts),
-                        min(v.co.z for v in self.verts)))
-        max_v = Vector((max(v.co.x for v in self.verts), max(v.co.y for v in self.verts),
-                        max(v.co.z for v in self.verts)))
+    @staticmethod
+    def get_bounding_verts(verts: list[BMVert]) -> tuple[Vector, Vector]:  # min, max
+        min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts),
+                        min(v.co.z for v in verts)))
+        max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts),
+                        max(v.co.z for v in verts)))
         return min_v, max_v
 
-    def get_bounding_center(self) -> Vector:
-        min_v, max_v = self.get_bounding_verts()
+    @staticmethod
+    def get_bounding_center(verts: list[BMVert]) -> Vector:
+        min_v, max_v = Geometry.get_bounding_verts(verts)
         return (max_v - min_v) * 0.5 + min_v
 
     @staticmethod
@@ -2205,7 +2220,7 @@ class Geometry:
                 next_faces.append(((left_next, right_next), pos + Vector((0, 1))))
             # face left
             if is_radial_face_valid(right_loop.link_loop_next):
-                left_next = right_loop.link_loop_next.link_loop_radial_next.link_loop_next
+                left_next = right_loop.link_loop_next.link_loop_radial_next.link_loop_prev
                 right_next = left_next.link_loop_next.link_loop_next
                 next_faces.append(((left_next, right_next), pos + Vector((-1, 0))))
         gr.clean_grid()
