@@ -921,7 +921,7 @@ class FloorSwitchNode(BaseNode, Node):
                         catch[inputs.true_floor] = None if facade.depth else true_floor
                         depth.update(facade.depth)
                     facade.depth = depth.copy()
-                    floor = true_floor or catch[inputs.true_floor] or inputs.true_floor(facade)
+                    floor = true_floor or (c := catch[inputs.true_floor]) and c.copy(facade) or inputs.true_floor(facade)
                     return floor
             else:
                 if inputs.false_floor:
@@ -932,7 +932,7 @@ class FloorSwitchNode(BaseNode, Node):
                         catch[inputs.false_floor] = None if facade.depth else false_floor
                         depth.update(facade.depth)
                     facade.depth = depth.copy()
-                    floor = false_floor or catch[inputs.false_floor] or inputs.false_floor(facade)
+                    floor = false_floor or (c := catch[inputs.false_floor]) and c.copy(facade) or inputs.false_floor(facade)
                     return floor
 
         return switch_floor
@@ -998,7 +998,7 @@ class FacadePatternNode(BaseNode, Node):
                 facade.cur_floor_ind = len(facade.floors_stack) - 1
                 floor = inputs.last(facade)
                 replaced = floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
-                if replaced != 1:
+                if len(replaced) != 1:
                     facade.cur_floor_ind = len(facade.floors_stack) - len(replaced)
                     floor = inputs.last(facade)
                     floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
@@ -1677,6 +1677,10 @@ class Shape(ABC):
     def scale_along_stack(self, factor: float):
         ...
 
+    @abstractmethod
+    def copy(self):
+        ...
+
 
 class Panel(Shape):
     def __init__(self, obj_index: int, size: Vector):
@@ -1687,6 +1691,12 @@ class Panel(Shape):
 
         # user attributes
         self.probability = 1
+
+    def copy(self):
+        panel = Panel(self.obj_index, self.size)
+        panel.scale = self.scale
+        panel.probability = self.probability
+        return panel
 
     @property
     def stack_size(self):
@@ -1713,9 +1723,15 @@ class Floor(Shape):
     def __init__(self, facade: 'Facade'):
         self.index = facade.cur_floor_ind
         self.height = None
-        self.z_level = None
         self.z_scale = 1
         self.panels_stack: ShapesStack[Panel] = ShapesStack(facade.size.x)
+
+    def copy(self, facade: 'Facade'):
+        floor = Floor(facade)
+        floor.height = self.height
+        floor.z_scale = self.z_scale
+        floor.panels_stack = self.panels_stack.copy()
+        return floor
 
     @property
     def stack_size(self):
@@ -1753,6 +1769,12 @@ class ShapesStack(Generic[ShapeType]):
         self._shapes: list[Shape] = []
         self._cum_width: list[float] = [0]
         self.max_width = max_width
+
+    def copy(self):
+        stack = ShapesStack(self.max_width)
+        stack._shapes = [shape.copy() for shape in self._shapes]
+        stack._cum_width = self._cum_width.copy()
+        return stack
 
     def append(self, shape: Shape):
         if self.can_be_added(shape):
@@ -2230,7 +2252,7 @@ class Geometry:
 def update_tree_timer():
     if BuildingStyleTree.was_changes:
         update_trees = []
-        for obj in bpy.data.objects:
+        for obj in bpy.context.scene.objects:  # objects after deleting are still in data.objects
             obj_props: ObjectProperties = obj.building_props
             if obj_props.building_style and obj_props.building_style.was_changed and obj_props.realtime:
                 try:
