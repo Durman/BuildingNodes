@@ -9,7 +9,8 @@ from enum import Enum, auto
 from graphlib import TopologicalSorter
 from itertools import count, chain, cycle, repeat, accumulate
 from math import isclose, inf
-from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any, Union, overload, Generic, TypeVar
+from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any, Union, overload, Generic, \
+    TypeVar, Generator, Iterator
 
 import bmesh
 import bpy
@@ -767,8 +768,13 @@ class PanelRandomizeNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         random_streams = dict()
+        last_facade = None
 
         def randomize_panels(facade: Facade):
+            nonlocal last_facade
+            if facade != last_facade:
+                random_streams.clear()
+                last_facade = facade
             stream = random_streams.get(facade.cur_floor_ind)
             if stream is None:
                 stream = random.Random(int(inputs.seed(facade)))
@@ -902,11 +908,11 @@ class FloorPatternNode(BaseNode, Node):
             if inputs.right:
                 facade.cur_panel_ind = len(pan_stack) - 1
                 panel = inputs.right(facade)
-                replaced = pan_stack.replace(panel, DistSlice(pan_stack.max_width - panel.size.x, None))
-                if len(replaced) != 1:
-                    facade.cur_panel_ind = len(pan_stack) - len(replaced)
+                overlapping = pan_stack[DistSlice(pan_stack.max_width - panel.size.x, None)]
+                if len(overlapping) != 1:
+                    facade.cur_panel_ind = len(pan_stack) - len(overlapping)
                     panel = inputs.right(facade)
-                    pan_stack.replace(panel, DistSlice(pan_stack.max_width - panel.size.x, None))
+                pan_stack.replace(panel, DistSlice(pan_stack.max_width - panel.size.x, None))
 
             if pan_stack:
                 if props.use_height:
@@ -1063,11 +1069,11 @@ class FacadePatternNode(BaseNode, Node):
             if inputs.last:
                 facade.cur_floor_ind = len(facade.floors_stack) - 1
                 floor = inputs.last(facade)
-                replaced = floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
-                if len(replaced) != 1:
-                    facade.cur_floor_ind = len(facade.floors_stack) - len(replaced)
+                overlapping = floors_stack[DistSlice(floors_stack.max_width - floor.stack_size, None)]
+                if len(overlapping) != 1:
+                    facade.cur_floor_ind = len(facade.floors_stack) - len(overlapping)
                     floor = inputs.last(facade)
-                    floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
+                floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
 
             if floors_stack:
                 floors_stack.fit_scale()
@@ -1727,6 +1733,13 @@ class DistSlice:
     def length(self):
         return self.stop - self.start
 
+    def __add__(self, other: float) -> 'DistSlice':
+        return DistSlice(self.start, None if self.stop is None else self.stop + other)
+
+    def __iadd__(self, other: float) -> 'DistSlice':
+        self.stop = None if self.stop is None else self.stop + other
+        return self
+
     def __repr__(self):
         start = self.start.__format__('.2f') if self.start is not None else None
         stop = self.stop.__format__('.2f') if self.stop is not None else None
@@ -2003,19 +2016,53 @@ class Facade:
                 │  floor     │
         start   *------------+-----→ Panels direction
         """
-        for face_i, floors_pos, panel_pos in self.grid.cells_and_positions:
-            face = build._base_bm.faces[face_i]
-            start, max_l = Geometry.get_bounding_loops(face)
-            direction = Vector((0, 0, 1))
-            panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
-            z_shift = 0
-            floors = self.floors_stack[floors_pos]
-            z_factor = floors_pos.length / sum(f.stack_size for f in floors)
-            for floor in self.floors_stack[floors_pos]:
-                size = floor.stack_size * z_factor
-                z_shift += size / 2
-                floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal, panel_pos, z_factor)
-                z_shift += size / 2
+        floor_rows = self.grid.cells_and_positions()
+        current_range = DistSlice(0, 0)
+        is_empty = False
+        first_panel_cells = None
+        floors = []
+        for _ in range(1000):
+            try:
+                floors_range, panel_cells = next(floor_rows)
+            except StopIteration:
+                is_empty = True
+            else:
+                if first_panel_cells is None:
+                    first_panel_cells = panel_cells
+                floors.extend(self.floors_stack[floors_range])
+                current_range += floors_range.length
+
+            if is_empty and not floors:
+                break
+
+            # the floor row is too small
+            if not is_empty and not floors:
+                continue
+
+            # check if there is unused top rows
+            if not is_empty and floors[-1] == self.floors_stack[-1]:
+                continue
+
+            z_factor = current_range.length / sum(f.stack_size for f in floors)
+            current_range = DistSlice(current_range.stop, current_range.stop)
+
+            for face_i, panels_range in first_panel_cells:
+                # if face_i == 54:
+                #     breakpoint()
+                face = build._base_bm.faces[face_i]
+                start, max_l = Geometry.get_bounding_loops(face)
+                direction = Vector((0, 0, 1))
+                panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
+                z_shift = 0
+                for floor in floors:
+                    size = floor.stack_size * z_factor
+                    z_shift += size / 2
+                    floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal,
+                                      panels_range, z_factor)
+                    z_shift += size / 2
+
+            floors.clear()
+            first_panel_cells = None
 
     def __repr__(self):
         floors = '\n'.join([repr(floor) for floor in self.floors_stack[::-1]])
@@ -2090,7 +2137,7 @@ class CentredMeshGrid:
     array([1., 3.])
     >>> [fi for fi in gr]
     [0, 1, 2]
-    >>> print("\\n".join([str(i) for i in gr.cells_and_positions]))
+    >>> print("\\n".join([str((i, d, d2)) for d, w in gr.cells_and_positions() for i, d2 in w]))
     (0, <DistSlice(0.00, 1.00)>, <DistSlice(0.00, 1.00)>)
     (1, <DistSlice(0.00, 1.00)>, <DistSlice(1.00, 3.00)>)
     (2, <DistSlice(1.00, 4.00)>, <DistSlice(0.00, 1.00)>)
@@ -2118,15 +2165,16 @@ class CentredMeshGrid:
     def size(self) -> Vector:
         return Vector((np.sum(self._size_x[self._size_x > 0]), np.sum(self._size_y[self._size_y > 0])))
 
-    @property
-    def cells_and_positions(self) -> Iterable[tuple[int, DistSlice, DistSlice]]:
+    def cells_and_positions(self) -> Iterator[tuple[DistSlice, Iterator[tuple[int, DistSlice]]]]:
         cum_size_x = list(accumulate(self._size_x, initial=0))
         cum_size_y = list(accumulate(self._size_y, initial=0))
-        for i_row, row in enumerate(self._grid):
-            for i_col, face_ind in enumerate(row):
+
+        def walk_along_x(_row):
+            for i_col, face_ind in enumerate(_row):
                 if face_ind != -1:
-                    yield face_ind, DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]),\
-                          DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
+                    yield face_ind, DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
+        for i_row, row in enumerate(self._grid):
+            yield DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]), walk_along_x(row)
 
     def _to_ind(self, coord: Vector) -> tuple[int, int]:
         return self._center_row + int(coord.y), self._center_col + int(coord.x)
