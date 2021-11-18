@@ -1035,8 +1035,8 @@ class FacadeAttributesNode(BaseNode, Node):
         def azimuth(build: Building):
             return build.cur_facade.azimuth
 
-        def material_id(build: Building):
-            return build.cur_facade_face.material_ind
+        def material_id(facade: Facade):
+            return facade.material_index
         return left_corner_angle, right_corner_angle, azimuth, material_id
 
 
@@ -1076,11 +1076,11 @@ class FacadeItemsNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs: Inputs, props):
-        def get_facade_item(build: Building):
+        def get_facade_item(facade: Facade):
             facade_funcs = {i: f for i, f in enumerate(inputs[1:])}
-            facade_f = facade_funcs.get(inputs.index(build))
+            facade_f = facade_funcs.get(inputs.index(facade))
             if facade_f:
-                return facade_f(build)
+                return facade_f(facade)
 
         return get_facade_item
 
@@ -1909,7 +1909,7 @@ class ShapesStack(Generic[ShapeType]):
 
 
 class Facade:
-    def __init__(self, grid: 'CentredMeshGrid'):
+    def __init__(self, grid: 'CentredMeshGrid', mat_index: int):
         self.cur_floor: Floor = None
         self.cur_floor_ind = None  # it's not always the last index in the floors stack
         self.cur_panel_ind = None  # it's not always the last index in the panels stack
@@ -1918,6 +1918,7 @@ class Facade:
 
         self.depth: set[Literal['floor_index']] = set()
 
+        self.material_index = mat_index
         self.left_wall_angle = None
         self.right_wall_angle = None
 
@@ -1970,6 +1971,7 @@ class Building:
     @property
     def facades(self) -> Iterable[Facade]:
         wall_lay = self._base_bm.faces.layers.int.get("Is wall") or self._base_bm.faces.layers.int.new("Is wall")
+        crease_lay = self._base_bm.edges.layers.crease.active
 
         visited = set()
         for face in self._base_bm.faces:
@@ -1979,8 +1981,8 @@ class Building:
             is_valid = is_vertical and len(face.verts) > 3 and not isclose(face.calc_area(), 0, abs_tol=0.1)
             if is_valid:
 
-                facade_grid = Geometry.connected_coplanar_faces(face)
-                facade = Facade(facade_grid)
+                facade_grid = Geometry.connected_coplanar_faces(face, crease_lay)
+                facade = Facade(facade_grid, face.material_index)
                 self.cur_facade = facade
                 yield facade
 
@@ -2194,11 +2196,15 @@ class Geometry:
             prev_loop = next_direction_loop
 
     @staticmethod
-    def connected_coplanar_faces(start_face: BMFace) -> CentredMeshGrid:
+    def connected_coplanar_faces(start_face: BMFace, crease_layer=None, split_by_material=True) -> CentredMeshGrid:
         def is_radial_face_valid(n_loop) -> bool:
             _current_face = n_loop.face
             _next_face = n_loop.link_loop_radial_next.face
             if _next_face == face or _next_face in visited:  # last condition does not protect entirely
+                pass
+            elif split_by_material and _current_face.material_index != _next_face.material_index:
+                pass
+            elif crease_layer and n_loop.edge[crease_layer] == 1:
                 pass
             elif len(_next_face.edges) != 4:
                 pass
