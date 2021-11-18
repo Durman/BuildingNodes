@@ -262,11 +262,31 @@ class BaseSocket:
             col = layout.column()
             col.prop(self, 'value', text=(self.user_name or text or self.default_name) if self.show_text else '')
 
+        elif self.node.bl_idname == PanelNode.bl_idname:
+            row = layout.row(align=True)
+            row.alignment = 'RIGHT'
+            row.prop(self.node.get_socket('object', is_input=True), 'value', text='')
+            row.operator(self.node.settings_viewer.bl_idname, text='', icon='PREFERENCES')
+
+        elif self.is_output and self.node.settings_viewer and self.index == 0:
+            row = layout.row()
+            row.alignment = 'RIGHT'
+            row.operator(self.node.settings_viewer.bl_idname, text='Settings', icon='PREFERENCES')
+            row.label(text=self.user_name or text or self.default_name)
+
         else:
             layout.label(text=self.user_name or text or self.default_name)
 
     def draw_color(self, context, node):
         return self.color
+
+    @property
+    def index(self):
+        sockets = self.node.outputs if self.is_output else self.node.inputs
+        for ind, sock in enumerate(sockets):
+            if sock.identifier == self.identifier:
+                return ind
+        raise LookupError
 
 
 class FacadeSocket(BaseSocket, NodeSocket):
@@ -422,6 +442,58 @@ class SocketTemplate(NamedTuple):
             sock.value = self.default_value
 
 
+class NodeSettingsOperator:
+    bl_label = "Edit the node options"
+    bl_options = {'INTERNAL', }
+
+    # internal usage
+    tree_name: StringProperty()
+    node_name: StringProperty()
+
+    def execute(self, context):  # without this method the Operator is considered as disabled :/
+        return {'FINISHED'}
+
+    @property
+    def node(self):
+        tree = bpy.data.node_groups[self.tree_name]
+        node = tree.nodes[self.node_name]  # todo https://developer.blender.org/T92835
+        return node
+
+    @node.setter
+    def node(self, node):
+        self.tree_name = node.id_data.name
+        self.node_name = node.name
+
+    def invoke(self, context, event):
+        node = context.node
+        self.node = node
+        wm = context.window_manager
+        return wm.invoke_props_dialog(self)
+
+    @staticmethod
+    def draw_settings(layout, node):  # should be used by the operator and the node side panel
+        NodeSettingsOperator.draw_sockets(layout, node)
+
+    def draw(self, context):
+        self.draw_settings(self.layout, self.node)
+
+    @staticmethod
+    def draw_sockets(layout, node):
+        for sock in node.inputs:
+            if sock.is_linked:
+                col = layout.column()
+                col.active = False
+                col.prop(sock, 'is_to_show', text=(sock.name or sock.default_name) + ' (connected)', emboss=False)
+            else:
+                col = layout.column()
+                if hasattr(sock, 'value'):
+                    row = col.row()
+                    row.prop(sock, 'value', text=sock.user_name or sock.name or sock.default_name)
+                    row.prop(sock, 'is_to_show', text='')
+                else:
+                    col.prop(sock, 'is_to_show', text=sock.name or sock.default_name)
+
+
 class BaseNode:
     category: Categories = None
     repeat_last_socket = False
@@ -429,6 +501,7 @@ class BaseNode:
     input_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
     output_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
     props_template: tuple = []
+    settings_viewer = None
 
     @classmethod
     def poll(cls, tree):
@@ -449,6 +522,10 @@ class BaseNode:
 
     def node_init(self):
         pass
+
+    def draw_buttons_ext(self, context, layout):
+        if self.settings_viewer:
+            self.settings_viewer.draw_settings(layout, self)
 
     def update(self):
         # update sockets
@@ -525,14 +602,19 @@ class ObjectInputNode(BaseNode, Node):
         layout.prop(self, 'model')
 
 
+class PanelNodeSettingsOperator(NodeSettingsOperator, Operator):
+    bl_idname = 'bn.panel_node_settings'
+
+
 class PanelNode(BaseNode, Node):
     bl_idname = 'bn_PanelNode'
     bl_label = "Panel"
     category = Categories.PANEL
+    settings_viewer = PanelNodeSettingsOperator
     Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding', 'probability'])
     Props = namedtuple('Props', ['panel_index'])
     input_template = Inputs(
-        SocketTemplate(ObjectSocket),
+        SocketTemplate(ObjectSocket, enabled=False),
         SocketTemplate(BoolSocket, 'Scalable', enabled=False),
         SocketTemplate(Vector4Socket, 'Scope padding', enabled=False),
         SocketTemplate(FloatSocket, 'Probability', enabled=False, default_value=1),
@@ -540,13 +622,7 @@ class PanelNode(BaseNode, Node):
     Outputs = namedtuple('Outputs', ['panel'])
     output_template = Outputs(SocketTemplate(PanelSocket))
 
-    mode: bpy.props.EnumProperty(items=[(i, i, '') for i in ['Object', 'Collection']])
     panel_index: bpy.props.IntProperty(description="Penal index in the collection")
-
-    def draw_buttons(self, context, layout):
-        row = layout.row(align=True)
-        row.prop(self, "mode", expand=True)
-        row.menu(ShowSocketsMenu.bl_idname, text='', icon='DOWNARROW_HLT')
 
     def draw_label(self):
         obj_socket = self.get_socket('object', is_input=True)
@@ -647,22 +723,12 @@ class SetPanelAttributeNode(BaseNode, Node):
         return set_panel_attr
 
 
-class PanelRandomizePropsOperator(Operator):
+class PanelRandomizePropsOperator(NodeSettingsOperator, Operator):
     bl_idname = "bn.panel_randomize_props"
-    bl_label = "Edit the node options"
-    bl_options = {'INTERNAL', }
-
-    # internal usage
-    tree_name: StringProperty()
-    node_name: StringProperty()
-
-    def execute(self, context):
-        return {'FINISHED'}
 
     def invoke(self, context, event):
         node = context.node
-        self.tree_name = node.id_data.name
-        self.node_name = node.name
+        self.node = node
         panel_names = []
         for search_node in node.id_data.walk_back(node):
             if search_node.bl_idname == PanelNode.bl_idname:
@@ -671,10 +737,10 @@ class PanelRandomizePropsOperator(Operator):
         wm = context.window_manager
         return wm.invoke_props_dialog(self)
 
-    def draw(self, context):
-        tree = bpy.data.node_groups[self.tree_name]
-        node = tree.nodes[self.node_name]  # todo https://developer.blender.org/T92835
-        col = self.layout.column()
+    @staticmethod
+    def draw_settings(layout, node):
+        tree = node.id_data
+        col = layout.column()
         col.use_property_split = True
         col.use_property_decorate = False
         col.prop(node.inputs['Seed'], 'value', text='Node seed')
@@ -690,15 +756,13 @@ class PanelRandomizeNode(BaseNode, Node):
     bl_label = "Panel Randomize"
     category = Categories.PANEL
     repeat_last_socket = True
+    settings_viewer = PanelRandomizePropsOperator
     Inputs = namedtuple('Inputs', ['seed', 'panel0', 'panel1', 'panel2', 'panel3'])
 
     def node_init(self):
         self.inputs.new(IntSocket.bl_idname, "Seed").display_shape = 'DIAMOND_DOT'
         self.inputs.new(PanelSocket.bl_idname, "")
         self.outputs.new(PanelSocket.bl_idname, "")
-
-    def draw_buttons(self, context, layout):
-        layout.operator(PanelRandomizePropsOperator.bl_idname, text='Settings', icon='PREFERENCES')
 
     @staticmethod
     def execute(inputs: Inputs, params):
@@ -783,10 +847,15 @@ class PanelItemsNode(BaseNode, Node):
         return get_facade_item
 
 
+class FloorPatternNodeSettings(NodeSettingsOperator, Operator):
+    bl_idname = 'bn.floor_pattern_node_settings'
+
+
 class FloorPatternNode(BaseNode, Node):
     bl_idname = 'bn_FloorPatternNode'
     bl_label = "Floor Pattern"
     category = Categories.FLOOR
+    settings_viewer = FloorPatternNodeSettings
     Inputs = namedtuple('Inputs', ['height', 'left', 'fill', 'distribute', 'right'])
     input_template = Inputs(
         SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT', 3),
@@ -802,9 +871,6 @@ class FloorPatternNode(BaseNode, Node):
     @property
     def props_template(self) -> Props:
         return self.Props(self.get_socket('height', is_input=True).is_to_show)
-
-    def draw_buttons(self, context, layout):
-        layout.menu(ShowSocketsMenu.bl_idname, text='Show sockets')
 
     @classmethod
     def execute(cls, inputs: Inputs, props: Props):
