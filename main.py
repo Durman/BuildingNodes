@@ -194,7 +194,7 @@ class BuildingStyleTree(NodeTree):
                 continue
             yield node
             visited.add(node)
-            prev_nodes.extend(prev_node for s in node.inputs if (prev_node := nodes.get(s)) is not None)
+            prev_nodes.extend(prev_node for s in list(node.inputs)[::-1] if (prev_node := nodes.get(s)) is not None)
 
     def update_facade_names(self):
         # todo make interface of all output nodes equal
@@ -219,7 +219,10 @@ class BuildingStyleTree(NodeTree):
                         template.init(node, is_input=True, identifier=key)
                         node.inputs.move(len(node.inputs) - 1, pos)
                 for key, sock in socks.items():
-                    sock.is_deprecated = not hasattr(node.input_template, key)
+                    is_deprecated = not hasattr(node.input_template, key)
+                    sock.is_deprecated = is_deprecated
+                    if is_deprecated:
+                        sock.enabled = True
             if node.output_template:
                 socks = {s.identifier: s for s in node.outputs}
                 for pos, (key, template) in enumerate(zip(node.output_template._fields, node.output_template)):
@@ -446,6 +449,8 @@ class SocketTemplate(NamedTuple):
 class NodeSettingsOperator:
     bl_label = "Edit the node options"
     bl_options = {'INTERNAL', }
+    panel_props = []
+    floor_props = []
 
     # internal usage
     tree_name: StringProperty()
@@ -468,31 +473,74 @@ class NodeSettingsOperator:
     def invoke(self, context, event):
         node = context.node
         self.node = node
-        wm = context.window_manager
-        return wm.invoke_props_dialog(self)
 
-    @staticmethod
-    def draw_settings(layout, node):  # should be used by the operator and the node side panel
-        NodeSettingsOperator.draw_sockets(layout, node)
+        if self.panel_props:
+            panel_names = []
+            for search_node in node.id_data.walk_back(node):
+                if search_node.bl_idname == PanelNode.bl_idname:
+                    panel_names.append(search_node.name)
+            node['panel_names'] = panel_names
+
+        if self.floor_props:
+            panel_names = []
+            for search_node in node.id_data.walk_back(node):
+                if search_node.bl_idname == FloorPatternNode.bl_idname:
+                    panel_names.append(search_node.name)
+            node['floor_names'] = panel_names
+
+        wm = context.window_manager
+        return wm.invoke_props_dialog(self, width=200)
 
     def draw(self, context):
-        self.draw_settings(self.layout, self.node)
+        self.draw_all(self.layout, self.node)
+
+    @staticmethod
+    def draw_all(layout, node):  # should be used in Property panel
+        box = layout.box()
+        NodeSettingsOperator.draw_sockets(box, node)
+        if node.settings_viewer.panel_props:
+            box = layout.box()
+            NodeSettingsOperator.draw_remote_props(box, node, 'PANEL', node.settings_viewer.panel_props)
+        if node.settings_viewer.floor_props:
+            box = layout.box()
+            NodeSettingsOperator.draw_remote_props(box, node, 'FLOOR', node.settings_viewer.floor_props)
 
     @staticmethod
     def draw_sockets(layout, node):
+        # grid = layout.grid_flow(row_major=True, columns=2)
+        col = layout.column()
+        col.alignment = 'RIGHT'
+        row = col.row()
+        row.label(text='Node properties value')
+        row.alignment = 'RIGHT'
+        row.label(text='Show')
         for sock in node.inputs:
-            if sock.is_linked:
-                col = layout.column()
-                col.active = False
-                col.prop(sock, 'is_to_show', text=(sock.name or sock.default_name) + ' (connected)', emboss=False)
-            else:
-                col = layout.column()
+            if not sock.is_linked:
+                row = col.row()
                 if hasattr(sock, 'value'):
-                    row = col.row()
                     row.prop(sock, 'value', text=sock.user_name or sock.name or sock.default_name)
                     row.prop(sock, 'is_to_show', text='')
                 else:
-                    col.prop(sock, 'is_to_show', text=sock.name or sock.default_name)
+                    row.label(text=sock.name or sock.default_name)
+                    row.prop(sock, 'is_to_show', text='')
+
+    @staticmethod
+    def draw_remote_props(layout, node, props_type: Literal['PANEL', 'FLOOR'], sock_identifiers: list):
+        node_names_key = 'panel_names' if props_type == 'PANEL' else 'floor_names'
+        tree = node.id_data
+        if node_names_key not in node or not node[node_names_key]:
+            layout.label(text="Remote props was not found")
+        else:
+            remote_nodes = [tree.nodes[n] for n in node[node_names_key]]
+            for identifier in sock_identifiers:
+                col = layout.column(align=True, heading=identifier)
+                # col.use_property_split = True
+                # col.use_property_decorate = False
+                for remote_node in remote_nodes:
+                    socket = remote_node.get_socket(identifier, is_input=True)
+                    node_label = remote_node.draw_label() if hasattr(remote_node, 'draw_label') else remote_node.bl_label
+                    row = col.row()
+                    row.prop(socket, 'value', text=f"{node_label}")
 
 
 class BaseNode:
@@ -526,7 +574,7 @@ class BaseNode:
 
     def draw_buttons_ext(self, context, layout):
         if self.settings_viewer:
-            self.settings_viewer.draw_settings(layout, self)
+            self.settings_viewer.draw_all(layout, self)
 
     def update(self):
         # update sockets
@@ -616,7 +664,7 @@ class PanelNode(BaseNode, Node):
     Props = namedtuple('Props', ['panel_index'])
     input_template = Inputs(
         SocketTemplate(ObjectSocket, enabled=False),
-        SocketTemplate(BoolSocket, 'Scalable', enabled=False),
+        SocketTemplate(BoolSocket, 'Scalable', enabled=False, default_value=True),
         SocketTemplate(Vector4Socket, 'Scope padding', enabled=False),
         SocketTemplate(FloatSocket, 'Probability', enabled=False, default_value=1),
     )
@@ -653,6 +701,7 @@ class PanelNode(BaseNode, Node):
                 size_v_catch = max_v - min_v
             panel = Panel(props.panel_index, size_v_catch)
             panel.probability = inputs.probability(facade)
+            panel.is_scalable = inputs.scalable(facade)
             panel.set_scope_padding(inputs.scope_padding(facade))  # for now it works only as scale
             return panel
         return panel_gen
@@ -726,30 +775,7 @@ class SetPanelAttributeNode(BaseNode, Node):
 
 class PanelRandomizePropsOperator(NodeSettingsOperator, Operator):
     bl_idname = "bn.panel_randomize_props"
-
-    def invoke(self, context, event):
-        node = context.node
-        self.node = node
-        panel_names = []
-        for search_node in node.id_data.walk_back(node):
-            if search_node.bl_idname == PanelNode.bl_idname:
-                panel_names.append(search_node.name)
-        node['panel_names'] = panel_names
-        wm = context.window_manager
-        return wm.invoke_props_dialog(self)
-
-    @staticmethod
-    def draw_settings(layout, node):
-        tree = node.id_data
-        col = layout.column()
-        col.use_property_split = True
-        col.use_property_decorate = False
-        col.prop(node.inputs['Seed'], 'value', text='Node seed')
-        col = col.column(align=True)
-        for panel_node_name in node['panel_names']:
-            panel_node = tree.nodes[panel_node_name]
-            socket = panel_node.get_socket('probability', is_input=True)
-            col.prop(socket, 'value', text=f"{panel_node.draw_label()} probability")
+    panel_props = ['probability']
 
 
 class PanelRandomizeNode(BaseNode, Node):
@@ -777,7 +803,7 @@ class PanelRandomizeNode(BaseNode, Node):
                 last_facade = facade
             stream = random_streams.get(facade.cur_floor_ind)
             if stream is None:
-                stream = random.Random(int(inputs.seed(facade)))
+                stream = random.Random(int(inputs.seed(facade)) + facade.index)
                 random_streams[facade.cur_floor_ind] = stream
             panels = [p for inp in inputs[1: -1] if (p := inp(facade)) is not None]
             return stream.choices(panels, weights=[p.probability for p in panels])[0]
@@ -855,6 +881,7 @@ class PanelItemsNode(BaseNode, Node):
 
 class FloorPatternNodeSettings(NodeSettingsOperator, Operator):
     bl_idname = 'bn.floor_pattern_node_settings'
+    panel_props = ['scalable']
 
 
 class FloorPatternNode(BaseNode, Node):
@@ -862,9 +889,10 @@ class FloorPatternNode(BaseNode, Node):
     bl_label = "Floor Pattern"
     category = Categories.FLOOR
     settings_viewer = FloorPatternNodeSettings
-    Inputs = namedtuple('Inputs', ['height', 'left', 'fill', 'distribute', 'right'])
+    Inputs = namedtuple('Inputs', ['height', 'scalable', 'left', 'fill', 'distribute', 'right'])
     input_template = Inputs(
         SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT', 3),
+        SocketTemplate(BoolSocket, 'Scalable', False, 'DIAMOND_DOT', True),
         SocketTemplate(PanelSocket, 'Left'),
         SocketTemplate(PanelSocket, 'Fill'),
         SocketTemplate(PanelSocket, 'Distribute'),
@@ -884,6 +912,7 @@ class FloorPatternNode(BaseNode, Node):
 
         def floor_gen(facade: Facade):
             floor = facade.get_floor()
+            floor.is_scalable = inputs.scalable(facade)
             pan_stack = floor.panels_stack
             if inputs.left:
                 facade.cur_panel_ind = 0
@@ -1028,13 +1057,18 @@ class StackFloorsNode(BaseNode, Node):
         return stack_floors
 
 
+class FacadePatternNodeOperator(NodeSettingsOperator, Operator):
+    bl_idname = 'bn.facade_pattern_node_settings'
+    floor_props = ['scalable']
+
+
 class FacadePatternNode(BaseNode, Node):
     bl_idname = 'bn_FacadePatternNode'
     bl_label = "Facade Pattern"
     category = Categories.FACADE
-    Inputs = namedtuple('Inputs', ['contribution', 'last', 'fill', 'distribute', 'first'])
+    settings_viewer = FacadePatternNodeOperator
+    Inputs = namedtuple('Inputs', ['last', 'fill', 'distribute', 'first'])
     input_template = Inputs(
-        SocketTemplate(FloatSocket, 'Contribution', False, default_value=1),
         SocketTemplate(FloorSocket, 'Last'),
         SocketTemplate(FloorSocket, 'Fill'),
         SocketTemplate(FloorSocket, 'Distribute'),
@@ -1052,7 +1086,8 @@ class FacadePatternNode(BaseNode, Node):
             if inputs.first:
                 facade.cur_floor_ind = len(facade.floors_stack)
                 floor = inputs.first(facade)
-                floors_stack.append(floor)
+                if floor:
+                    floors_stack.append(floor)
             if inputs.fill:
                 for i in range(10000):
                     for _ in range(10):
@@ -1088,12 +1123,13 @@ class FacadeAttributesNode(BaseNode, Node):
     bl_idname = 'bn_FacadeAttributesNode'
     bl_label = 'Facade Attributes'
     category = Categories.FACADE
-    Outputs = namedtuple('Outputs', ['left_angle', 'right_angle', 'azimuth', 'mat_id'])
+    Outputs = namedtuple('Outputs', ['left_angle', 'right_angle', 'azimuth', 'mat_id', 'facade_index'])
     output_template = Outputs(
         SocketTemplate(FloatSocket, 'Left corner angle', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Right corner angle', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Azimuth', display_shape='DIAMOND'),
         SocketTemplate(IntSocket, 'Material index', display_shape='DIAMOND'),
+        SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND'),
     )
 
     @staticmethod
@@ -1109,7 +1145,10 @@ class FacadeAttributesNode(BaseNode, Node):
 
         def material_id(facade: Facade):
             return facade.material_index
-        return left_corner_angle, right_corner_angle, azimuth, material_id
+
+        def facade_index(facade: Facade):
+            return facade.index
+        return left_corner_angle, right_corner_angle, azimuth, material_id, facade_index
 
 
 class SetFacadeAttributeNode(BaseNode, Node):
@@ -1747,6 +1786,8 @@ class DistSlice:
 
 
 class Shape(ABC):
+    is_scalable: bool
+
     @property
     @abstractmethod
     def stack_size(self):
@@ -1770,6 +1811,7 @@ class Panel(Shape):
 
         # user attributes
         self.probability = 1
+        self.is_scalable = True
 
     def copy(self):
         panel = Panel(self.obj_index, self.size)
@@ -1801,9 +1843,12 @@ class Panel(Shape):
 class Floor(Shape):
     def __init__(self, facade: 'Facade'):
         self.index = facade.cur_floor_ind
-        self.height = None
         self.z_scale = 1
         self.panels_stack: ShapesStack[Panel] = ShapesStack(facade.size.x)
+
+        # user attributes
+        self.height = None
+        self.is_scalable = True
 
     def copy(self, facade: 'Facade'):
         floor = Floor(facade)
@@ -1827,12 +1872,15 @@ class Floor(Shape):
         """
         xy_shift = 0
         panels = self.panels_stack[panels_range]
-        xy_factor = panels_range.length / sum(p.stack_size for p in panels)
+        width = sum(p.stack_size for p in panels)
+        scalable_width = sum(p.stack_size for p in panels if p.is_scalable)
+        xy_factor = (panels_range.length - (width - scalable_width)) / scalable_width
         for panel in panels:
-            size_x = panel.stack_size * xy_factor
+            p_xy_factor = xy_factor if panel.is_scalable else 1
+            size_x = panel.stack_size * p_xy_factor
             z_scale = self.stack_size / panel.size.y * z_factor
             xy_shift += size_x / 2
-            panel.do_instance(build, start + direction * xy_shift, Vector((xy_factor, z_scale)), normal)
+            panel.do_instance(build, start + direction * xy_shift, Vector((p_xy_factor, z_scale)), normal)
             xy_shift += size_x / 2
 
     def __repr__(self):
@@ -1869,16 +1917,18 @@ class ShapesStack(Generic[ShapeType]):
         return removed_panels
 
     @property
-    def is_full(self):
-        return self._cum_width[-1] > self.max_width
-
-    @property
     def width(self):
         return self._cum_width[-1]
 
+    def calc_scalable_width(self):
+        return sum(s.stack_size for s in self._shapes if s.is_scalable)
+
     def fit_scale(self):
-        scale = self.max_width / self.width
-        for shape in self._shapes:
+        scalable_width = self.calc_scalable_width()
+        if not scalable_width:
+            return
+        scale = (self.max_width - (self.width - scalable_width)) / scalable_width
+        for shape in (s for s in self._shapes if s.is_scalable):
             shape.scale_along_stack(scale)
         self._cum_width = list(accumulate((p.stack_size for p in self._shapes), initial=0))
 
@@ -1892,8 +1942,14 @@ class ShapesStack(Generic[ShapeType]):
         +-------+------+------  in this case the panel should not be added
         │ *     │ *    │
         """
-        cur_scale_dist = abs(self.max_width - self.width)
-        new_scale_dist = abs(self.width + shape.stack_size - self.max_width)
+        cur_scale_dist = self.max_width - self.width
+        if cur_scale_dist < 0:
+            return False
+        new_scale_dist = self.width + shape.stack_size - self.max_width
+        if new_scale_dist < 0:
+            return True
+        if new_scale_dist > self.calc_scalable_width():
+            return False
         return new_scale_dist < cur_scale_dist
 
     def copy_range(self, dist_range: DistSlice) -> 'ShapesStack':
@@ -1988,7 +2044,8 @@ class ShapesStack(Generic[ShapeType]):
 
 
 class Facade:
-    def __init__(self, grid: 'CentredMeshGrid', mat_index: int):
+    def __init__(self, index, grid: 'CentredMeshGrid', mat_index: int):
+        self.index = index
         self.cur_floor: Floor = None
         self.cur_floor_ind = None  # it's not always the last index in the floors stack
         self.cur_panel_ind = None  # it's not always the last index in the panels stack
@@ -2043,7 +2100,10 @@ class Facade:
             if not is_empty and floors[-1] == self.floors_stack[-1]:
                 continue
 
-            z_factor = current_range.length / sum(f.stack_size for f in floors)
+            height = sum(f.stack_size for f in floors)
+            scalable_height = sum(f.stack_size for f in floors if f.is_scalable)
+            z_factor = (current_range.length - (height - scalable_height)) / scalable_height
+
             current_range = DistSlice(current_range.stop, current_range.stop)
 
             for face_i, panels_range in first_panel_cells:
@@ -2055,10 +2115,11 @@ class Facade:
                 panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
                 z_shift = 0
                 for floor in floors:
-                    size = floor.stack_size * z_factor
+                    f_z_factor = z_factor if floor.is_scalable else 1
+                    size = floor.stack_size * f_z_factor
                     z_shift += size / 2
                     floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal,
-                                      panels_range, z_factor)
+                                      panels_range, f_z_factor)
                     z_shift += size / 2
 
             floors.clear()
@@ -2087,6 +2148,7 @@ class Building:
         crease_lay = self._base_bm.edges.layers.crease.active
 
         visited = set()
+        fac_ind = count()
         for face in self._base_bm.faces:
             if face in visited:
                 continue
@@ -2095,7 +2157,7 @@ class Building:
             if is_valid:
 
                 facade_grid = Geometry.connected_coplanar_faces(face, crease_lay)
-                facade = Facade(facade_grid, face.material_index)
+                facade = Facade(next(fac_ind), facade_grid, face.material_index)
                 self.cur_facade = facade
                 yield facade
 
