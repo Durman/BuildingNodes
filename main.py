@@ -605,7 +605,7 @@ class BaseNode:
         pass
 
     def gen_input_mapping(self) -> Optional[Type[NamedTuple]]:
-        if self.repeat_last_socket or self.bl_idname == BuildingStyleNode.bl_idname:
+        if self.repeat_last_socket or self.repeat_first_socket:
             input_names = []
             index = count()
             for sock in self.inputs:
@@ -917,10 +917,11 @@ class FloorPatternNode(BaseNode, Node):
             if inputs.left:
                 facade.cur_panel_ind = 0
                 panel = inputs.left(facade)
-                try:
-                    pan_stack.append(panel)
-                except IndexError:
-                    pass
+                if panel:
+                    try:
+                        pan_stack.append(panel)
+                    except IndexError:
+                        pass
             if inputs.fill:
                 for _ in range(1000):
                     for _ in range(10):
@@ -937,11 +938,12 @@ class FloorPatternNode(BaseNode, Node):
             if inputs.right:
                 facade.cur_panel_ind = len(pan_stack) - 1
                 panel = inputs.right(facade)
-                overlapping = pan_stack[DistSlice(pan_stack.max_width - panel.size.x, None)]
-                if len(overlapping) != 1:
-                    facade.cur_panel_ind = len(pan_stack) - len(overlapping)
-                    panel = inputs.right(facade)
-                pan_stack.replace(panel, DistSlice(pan_stack.max_width - panel.size.x, None))
+                if panel:
+                    overlapping = pan_stack[DistSlice(pan_stack.max_width - panel.size.x, None)]
+                    if len(overlapping) != 1:
+                        facade.cur_panel_ind = len(pan_stack) - len(overlapping)
+                        panel = inputs.right(facade)
+                    pan_stack.replace([panel], DistSlice(pan_stack.max_width - panel.size.x, None))
 
             if pan_stack:
                 if props.use_height:
@@ -1039,6 +1041,31 @@ class FloorSwitchNode(BaseNode, Node):
         return switch_floor
 
 
+class ChainFloorsNode(BaseNode, Node):
+    bl_idname = 'bn_ChainFloorsNode'
+    bl_label = "Chain Floors"
+    category = Categories.FLOOR
+    repeat_first_socket = True
+    Inputs = namedtuple('Inputs', ['floor0', 'floor1', 'floor2', 'floor3'])
+
+    def node_init(self):
+        self.inputs.new(FloorSocket.bl_idname, "")
+        self.outputs.new(FloorSocket.bl_idname, "")
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def chain_floors(facade: Facade):
+            floors_chain = []
+            shift_floor_ind = count()
+            for floor_f in inputs[:0:-1]:
+                facade.cur_floor_ind += next(shift_floor_ind)
+                floor = floor_f(facade)
+                if floor:
+                    floors_chain.append(floor)
+            return floors_chain
+        return chain_floors
+
+
 class StackFloorsNode(BaseNode, Node):
     bl_idname = 'bn_StackFloorsNode'
     bl_label = "Stack Floors"
@@ -1087,7 +1114,10 @@ class FacadePatternNode(BaseNode, Node):
                 facade.cur_floor_ind = len(facade.floors_stack)
                 floor = inputs.first(facade)
                 if floor:
-                    floors_stack.append(floor)
+                    if isinstance(floor, list):
+                        floors_stack.extend(floor)
+                    else:
+                        floors_stack.append(floor)
             if inputs.fill:
                 for i in range(10000):
                     for _ in range(10):
@@ -1098,17 +1128,26 @@ class FacadePatternNode(BaseNode, Node):
                     if floor is None:
                         break
                     try:
-                        floors_stack.append(floor)
+                        if isinstance(floor, list):
+                            floors_stack.extend(floor)
+                        else:
+                            floors_stack.append(floor)
                     except IndexError:
                         break
             if inputs.last:
                 facade.cur_floor_ind = len(facade.floors_stack) - 1
                 floor = inputs.last(facade)
-                overlapping = floors_stack[DistSlice(floors_stack.max_width - floor.stack_size, None)]
+                if not isinstance(floor, list):
+                    floor = [floor]
+                size = sum(f.stack_size for f in floor)
+                overlapping = floors_stack[DistSlice(floors_stack.max_width - size, None)]
                 if len(overlapping) != 1:
                     facade.cur_floor_ind = len(facade.floors_stack) - len(overlapping)
                     floor = inputs.last(facade)
-                floors_stack.replace(floor, DistSlice(floors_stack.max_width - floor.stack_size, None))
+                    if not isinstance(floor, list):
+                        floor = [floor]
+                    size = sum(f.stack_size for f in floor)
+                floors_stack.replace(floor, DistSlice(floors_stack.max_width - size, None))
 
             if floors_stack:
                 floors_stack.fit_scale()
@@ -1134,11 +1173,11 @@ class FacadeAttributesNode(BaseNode, Node):
 
     @staticmethod
     def execute(inputs, props):
-        def left_corner_angle(build: Building):
-            return build.cur_facade.left_wall_angle
+        def left_corner_angle(facade: Facade):
+            return facade.left_wall_angle
 
-        def right_corner_angle(build: Building):
-            return build.cur_facade.right_wall_angle
+        def right_corner_angle(facade: Facade):
+            return facade.right_wall_angle
 
         def azimuth(build: Building):
             return build.cur_facade.azimuth
@@ -1904,16 +1943,23 @@ class ShapesStack(Generic[ShapeType]):
         return stack
 
     def append(self, shape: Shape):
-        if self.can_be_added(shape):
+        if self.can_be_added(shape.stack_size):
             self._cum_width.append(self._cum_width[-1] + (shape and shape.stack_size or 0))
             self._shapes.append(shape)
         else:
             raise IndexError("Given shape is too big or shape stuck is full")
 
-    def replace(self, shape: Shape, position: DistSlice) -> list[Shape]:
+    def extend(self, shapes: list[Shape]):
+        if self.can_be_added(sum(s.stack_size for s in shapes)):
+            self._cum_width.extend(self._cum_width[-1] + s.stack_size for s in shapes)
+            self._shapes.extend(shapes)
+        else:
+            raise IndexError("Given shapes are too big or shape stuck is full")
+
+    def replace(self, shapes: list[Shape], position: DistSlice) -> list[Shape]:
         replace_ind = self._range_to_indexes(position)
         removed_panels = self[replace_ind]
-        self[replace_ind] = shape
+        self[replace_ind] = shapes
         return removed_panels
 
     @property
@@ -1932,7 +1978,7 @@ class ShapesStack(Generic[ShapeType]):
             shape.scale_along_stack(scale)
         self._cum_width = list(accumulate((p.stack_size for p in self._shapes), initial=0))
 
-    def can_be_added(self, shape: Shape) -> bool:
+    def can_be_added(self, size: float) -> bool:
         """               │←-→│ the scale distance if the shape will be added
         +-------+------+------+-----
         │ *     │ *    │  new │
@@ -1945,7 +1991,7 @@ class ShapesStack(Generic[ShapeType]):
         cur_scale_dist = self.max_width - self.width
         if cur_scale_dist < 0:
             return False
-        new_scale_dist = self.width + shape.stack_size - self.max_width
+        new_scale_dist = self.width + size - self.max_width
         if new_scale_dist < 0:
             return True
         if new_scale_dist > self.calc_scalable_width():
@@ -2007,7 +2053,12 @@ class ShapesStack(Generic[ShapeType]):
             return self._shapes[self._range_to_indexes(key)]
         raise TypeError
 
-    def __setitem__(self, key, shape: Shape):
+    @overload
+    def __setitem__(self, key: int, shape: Shape): ...
+    @overload
+    def __setitem__(self, key: slice, shape: list[Shape]): ...
+
+    def __setitem__(self, key, shape):
         if isinstance(key, int):
             index = key
             old_panel_size = self._cum_width[index + 1] - self._cum_width[index]
@@ -2017,13 +2068,15 @@ class ShapesStack(Generic[ShapeType]):
             self._cum_width = [self._cum_width[:index + 1]] + [old_s + impact_size for old_s in
                                                                self._cum_width[index + 1:]]
         elif isinstance(key, slice):
+            shapes = shape
             start = key.start if key.start is not None else 0
             stop = key.stop if key.stop is not None else len(self._shapes)
             old_shapes_size = sum(s - s_prev for s, s_prev in zip(
                 self._cum_width[start + 1: stop + 1], self._cum_width[start: stop]))
-            impact_size = shape.stack_size - old_shapes_size
-            self._shapes[start: stop] = [shape]
-            self._cum_width[start + 1: stop + 1] = [self._cum_width[start] + shape.stack_size]
+            size = sum(s.stack_size for s in shapes)
+            impact_size = size - old_shapes_size
+            self._shapes[start: stop] = shapes
+            self._cum_width[start + 1: stop + 1] = [self._cum_width[start] + size]
             self._cum_width = self._cum_width[:start + 2] + [old_s + impact_size for old_s
                                                                  in self._cum_width[start + 2:]]
         else:
@@ -2158,6 +2211,11 @@ class Building:
 
                 facade_grid = Geometry.connected_coplanar_faces(face, crease_lay)
                 facade = Facade(next(fac_ind), facade_grid, face.material_index)
+                left_ind, right_ind = facade_grid.corner_cells()
+                left_loop, _ = Geometry.get_bounding_loops(self._base_bm.faces[left_ind])
+                facade.left_wall_angle = left_loop.link_loop_prev.edge.calc_face_angle(3.14)
+                _, right_loop = Geometry.get_bounding_loops(self._base_bm.faces[right_ind])
+                facade.right_wall_angle = right_loop.link_loop_prev.edge.calc_face_angle(3.14)
                 self.cur_facade = facade
                 yield facade
 
@@ -2237,6 +2295,11 @@ class CentredMeshGrid:
                     yield face_ind, DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
         for i_row, row in enumerate(self._grid):
             yield DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]), walk_along_x(row)
+
+    def corner_cells(self) -> tuple[int, int]:
+        left = next(fi[0] for fi in self._grid if fi[0] != -1)
+        right = next(fi[-1] for fi in self._grid if fi[-1] != -1)
+        return left, right
 
     def _to_ind(self, coord: Vector) -> tuple[int, int]:
         return self._center_row + int(coord.y), self._center_col + int(coord.x)
