@@ -4,11 +4,14 @@ import random
 import sys
 import traceback
 from abc import ABC, abstractmethod
+from cProfile import Profile
 from collections import namedtuple, defaultdict, deque
 from enum import Enum, auto
+from functools import wraps
 from graphlib import TopologicalSorter
 from itertools import count, chain, cycle, repeat, accumulate
 from math import isclose, inf
+from pstats import Stats
 from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any, Union, overload, Generic, \
     TypeVar, Generator, Iterator
 
@@ -25,6 +28,19 @@ from nodeitems_utils import NodeCategory, NodeItem
 
 
 FACE_STYLE_LAYER_NAME = "BnStyleName"  # should be unchanged between versions
+
+
+def profile(fun=None, *, sort: Literal['time', 'cumulative'] = 'time', length=10):
+    if fun is None:
+        return lambda f: profile(f, sort=sort, length=length)
+
+    @wraps(fun)
+    def inner(*args, **kwargs):
+        with Profile() as pr:
+            res = fun(*args, **kwargs)
+            Stats(pr).strip_dirs().sort_stats(sort).print_stats(length)
+        return res
+    return inner
 
 
 class FacadeTreeNames(PropertyGroup):
@@ -75,6 +91,8 @@ class BuildingStyleTree(NodeTree):
         self.store_instances()
         sock_data = dict()
         for node, prev_socks in self.walk():
+
+            # grab data from previous nodes
             in_data = dict()
             for from_sock, to_sock in zip(prev_socks, node.inputs):
                 if from_sock is not None:
@@ -574,7 +592,7 @@ class BaseNode:
 
     def draw_buttons_ext(self, context, layout):
         if self.settings_viewer:
-            self.settings_viewer.draw_all(layout, self)
+            self.settings_viewer.draw_sockets(layout, self)
 
     def update(self):
         # update sockets
@@ -801,10 +819,10 @@ class PanelRandomizeNode(BaseNode, Node):
             if facade != last_facade:
                 random_streams.clear()
                 last_facade = facade
-            stream = random_streams.get(facade.cur_floor_ind)
+            stream = random_streams.get(facade.cur_floor)
             if stream is None:
                 stream = random.Random(int(inputs.seed(facade)) + facade.index)
-                random_streams[facade.cur_floor_ind] = stream
+                random_streams[facade.cur_floor] = stream
             panels = [p for inp in inputs[1: -1] if (p := inp(facade)) is not None]
             return stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
@@ -877,6 +895,44 @@ class PanelItemsNode(BaseNode, Node):
                 return panel_f(build)
 
         return get_facade_item
+
+
+class MirrorPanelNodeSettings(NodeSettingsOperator, Operator):
+    bl_idname = 'bn.mirror_panel_node_settings'
+
+
+class MirrorPanelNode(BaseNode, Node):
+    bl_idname = 'bn_MirrorPanelNode'
+    bl_label = 'Mirror Panel'
+    category = Categories.PANEL
+    settings_viewer = MirrorPanelNodeSettings
+    Inputs = namedtuple('Inputs', ['panel', 'mirror_x', 'mirror_y'])
+    input_template = Inputs(
+        SocketTemplate(PanelSocket),
+        SocketTemplate(BoolSocket, 'Mirror along X', False, display_shape='DIAMOND_DOT'),
+        SocketTemplate(BoolSocket, 'Mirror along Y', False, display_shape='DIAMOND_DOT'),
+    )
+    Outputs = namedtuple('Outputs', ['panel'])
+    output_template = Outputs(SocketTemplate(PanelSocket))
+
+    def draw_label(self):
+        x = 'X' if self.get_socket('mirror_x', True).value else ''
+        y = 'Y' if self.get_socket('mirror_y', True).value else ''
+        if x or y:
+            return f"{self.bl_label} - [{x}{' ' if x and y else ''}{y}]"
+        return f"{self.bl_label}"
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def mirror_panel(facade: Facade):
+            panel = inputs.panel(facade)
+            if panel:
+                if inputs.mirror_x(facade):
+                    panel.mirror_x = True
+                if inputs.mirror_y(facade):
+                    panel.mirror_y = True
+            return panel
+        return mirror_panel
 
 
 class FloorPatternNodeSettings(NodeSettingsOperator, Operator):
@@ -1119,13 +1175,13 @@ class FacadePatternNode(BaseNode, Node):
                     else:
                         floors_stack.append(floor)
             if inputs.fill:
-                for i in range(10000):
+                for i in range(1000):
                     for _ in range(10):
                         facade.cur_floor_ind = len(facade.floors_stack)
                         floor = inputs.fill(facade)
                         if floor:
                             break
-                    if floor is None:
+                    if not floor:
                         break
                     try:
                         if isinstance(floor, list):
@@ -1851,6 +1907,8 @@ class Panel(Shape):
         # user attributes
         self.probability = 1
         self.is_scalable = True
+        self.mirror_x = False
+        self.mirror_y = False
 
     def copy(self):
         panel = Panel(self.obj_index, self.size)
@@ -1870,9 +1928,10 @@ class Panel(Shape):
         self.size.y += padding[1] + padding[3]
 
     def do_instance(self, build: 'Building', location: Vector, scale: Vector, normal: Vector):
+        mirror_vec = Vector((-1 if self.mirror_x else 1, -1 if self.mirror_y else 1))
         vec = build.bm.verts.new(location)
         vec[build.norm_lay] = normal
-        vec[build.scale_lay] = (*(self.scale * scale), 1)
+        vec[build.scale_lay] = (*(self.scale * mirror_vec * scale), 1)
         vec[build.ind_lay] = self.obj_index
 
     def __repr__(self):
