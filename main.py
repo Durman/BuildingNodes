@@ -54,7 +54,7 @@ class BuildingStyleTree(NodeTree):
     bl_icon = 'HOME'
     was_changes = False  # flag to timer
 
-    inst_col: bpy.props.PointerProperty(type=bpy.types.Collection, description="Keep all panels to be instanced")
+    inst_col: bpy.props.PointerProperty(type=bpy.types.Collection, description="Keep all panels to be instanced")  # todo should be set to None during copying
     was_changed: bpy.props.BoolProperty(description="If True the tree should be reevaluated")
     facade_names: bpy.props.CollectionProperty(type=FacadeTreeNames)
 
@@ -284,11 +284,16 @@ class BaseSocket:
             col = layout.column()
             col.prop(self, 'value', text=(self.user_name or text or self.default_name) if self.show_text else '')
 
-        elif self.node.bl_idname == PanelNode.bl_idname:
+        elif self.node.main_prop:
             row = layout.row(align=True)
-            row.alignment = 'RIGHT'
-            row.prop(self.node.get_socket('object', is_input=True), 'value', text='')
-            row.operator(self.node.settings_viewer.bl_idname, text='', icon='PREFERENCES')
+            sock = self.node.get_socket(self.node.main_prop, is_input=True)
+            if sock.enabled:
+                row.label(text=self.user_name or text or self.default_name)
+            else:
+                row.prop(sock, 'value', text='')
+            if self.node.settings_viewer:
+                row.alignment = 'RIGHT'
+                row.operator(self.node.settings_viewer.bl_idname, text='', icon='PREFERENCES')
 
         elif self.is_output and self.node.settings_viewer and self.index == 0:
             row = layout.row()
@@ -569,6 +574,7 @@ class BaseNode:
     output_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
     props_template: tuple = []
     settings_viewer = None
+    main_prop = None  # name of the input socket to show its value in first output socket
 
     @classmethod
     def poll(cls, tree):
@@ -688,6 +694,7 @@ class PanelNode(BaseNode, Node):
     )
     Outputs = namedtuple('Outputs', ['panel'])
     output_template = Outputs(SocketTemplate(PanelSocket))
+    main_prop = 'object'
 
     panel_index: bpy.props.IntProperty(description="Penal index in the collection")
 
@@ -823,7 +830,7 @@ class PanelRandomizeNode(BaseNode, Node):
             if stream is None:
                 stream = random.Random(int(inputs.seed(facade)) + facade.index)
                 random_streams[facade.cur_floor] = stream
-            panels = [p for inp in inputs[1: -1] if (p := inp(facade)) is not None]
+            panels = [p for inp in inputs[1: -1] if inp and (p := inp(facade)) is not None]
             return stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
 
@@ -909,7 +916,7 @@ class MirrorPanelNode(BaseNode, Node):
     Inputs = namedtuple('Inputs', ['panel', 'mirror_x', 'mirror_y'])
     input_template = Inputs(
         SocketTemplate(PanelSocket),
-        SocketTemplate(BoolSocket, 'Mirror along X', False, display_shape='DIAMOND_DOT'),
+        SocketTemplate(BoolSocket, 'Mirror along X', False, display_shape='DIAMOND_DOT', default_value=True),
         SocketTemplate(BoolSocket, 'Mirror along Y', False, display_shape='DIAMOND_DOT'),
     )
     Outputs = namedtuple('Outputs', ['panel'])
@@ -933,6 +940,53 @@ class MirrorPanelNode(BaseNode, Node):
                     panel.mirror_y = True
             return panel
         return mirror_panel
+
+
+class JoinPanelsNode(BaseNode, Node):
+    bl_idname = 'bn_JoinPanelsNode'
+    bl_label = 'Join Panels'
+    category = Categories.PANEL
+    repeat_last_socket = True
+    Inputs = namedtuple('Inputs', ['panel0', 'panel1', 'panel2'])
+    Outputs = namedtuple('Outputs', ['panel'])
+    Props = namedtuple('Props', ['align'])
+
+    align: EnumProperty(items=[(i, i.capitalize(), '') for i in ['RIGHT', 'TOP', 'LEFT', 'BOTTOM']],
+                        update=lambda s, c: s.id_data.update())
+
+    def node_init(self):
+        self.inputs.new(PanelSocket.bl_idname, '')
+        self.outputs.new(PanelSocket.bl_idname, '')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "align", text='')
+
+    @staticmethod
+    def execute(inputs: Inputs, props: Props):
+        def join_panels(facade: Facade):
+            shell = PanelShell()
+            for panel_f in inputs:
+                if panel_f is None:
+                    continue
+                panel = panel_f(facade)
+                if not panel:
+                    continue
+
+                if shell.size == Vector((0, 0)):
+                    shell.add_panel(panel, Vector((0, 0)))
+                elif props.align == 'RIGHT':
+                    shell.add_panel(panel, Vector((shell.size.x / 2 + panel.size.x / 2, 0)))
+                elif props.align == 'TOP':
+                    shell.add_panel(panel, Vector((0, shell.size.y / 2 + panel.size.y / 2)))
+                elif props.align == 'LEFT':
+                    shell.add_panel(panel, Vector((-shell.size.x / 2 + -panel.size.x / 2, 0)))
+                elif props.align == 'BOTTOM':
+                    shell.add_panel(panel, Vector((0, -shell.size.y / 2 + -panel.size.y / 2)))
+                else:
+                    raise TypeError
+            if shell.has_sub_panels():
+                return shell
+        return join_panels
 
 
 class FloorPatternNodeSettings(NodeSettingsOperator, Operator):
@@ -1335,6 +1389,27 @@ class MathNode(BaseNode, Node):
         def math(build):
             return funcs[props.mode](inputs.val1(build), inputs.val2(build), inputs.tolerance(build))
         return math
+
+
+class IntegerValueNodeSettings(NodeSettingsOperator, Operator):
+    bl_idname = 'bn.integer_value_node_settings'
+
+
+class IntegerValueNode(BaseNode, Node):
+    bl_idname = "bn_IntegerValueNode"
+    bl_label = "Integer"
+    Inputs = namedtuple('Inputs', ['value'])
+    input_template = Inputs(SocketTemplate(IntSocket, enabled=False))
+    Outputs = namedtuple('Outputs', ['value'])
+    output_template = Outputs(SocketTemplate(IntSocket))
+    main_prop = 'value'
+    settings_viewer = IntegerValueNodeSettings
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def get_integer(facade: Facade):
+            return inputs.value(facade)
+        return get_integer
 
 
 class ObjectPanel(Panel):
@@ -1826,7 +1901,7 @@ class EditPanelAttributesOperator(Operator):
             for vert in bm.verts:
                 vert[sc_lay] = vert.select
             points = [v for v in bm.verts if v[sc_lay]] or bm.verts
-            center = Geometry.get_bounding_center(points)
+            center = Geometry.get_bounding_center([v.co for v in points])
             glob_center = center * obj.scale
             glob_center.rotate(obj.rotation_euler)
             obj.location += glob_center
@@ -1927,7 +2002,7 @@ class Panel(Shape):
         self.size.x += padding[0] + padding[2]
         self.size.y += padding[1] + padding[3]
 
-    def do_instance(self, build: 'Building', location: Vector, scale: Vector, normal: Vector):
+    def do_instance(self, build: 'Building', location: Vector, scale: Vector, normal: Vector, direction):
         mirror_vec = Vector((-1 if self.mirror_x else 1, -1 if self.mirror_y else 1))
         vec = build.bm.verts.new(location)
         vec[build.norm_lay] = normal
@@ -1936,6 +2011,60 @@ class Panel(Shape):
 
     def __repr__(self):
         return f"<Panel:{self.obj_index}>"
+
+
+class PanelShell(Shape):
+    def __init__(self):
+        self._sub_panels: list[Panel] = []
+        self._sub_positions: list[Vector] = []
+        self.size: Vector = Vector((0, 0))
+        self.scale: Vector = Vector((1, 1))
+
+        # user attributes
+        self.mirror_x = False
+        self.mirror_y = False
+
+    def copy(self):
+        shell = PanelShell()
+        shell._sub_panels = self._sub_panels
+        return shell
+
+    @property
+    def probability(self):
+        return sum(p.probability for p in self._sub_panels) / len(self._sub_panels)
+
+    @property
+    def is_scalable(self):
+        return any(p.is_scalable for p in self._sub_panels)
+
+    def add_panel(self, panel: Panel, position: Vector):
+        self._sub_panels.append(panel)
+        self._sub_positions.append(position)
+        shell_corners = [Vector((-self.size.x / 2, -self.size.y / 2)), Vector((self.size.x / 2, self.size.y / 2))]
+        # todo take into account scale of the panel?
+        panel_corners = [Vector((-panel.size.x / 2, -panel.size.y / 2)), Vector((panel.size.x / 2, panel.size.y / 2))]
+        panel_corners = [c + position for c in panel_corners]
+        min_v, max_v = Geometry.get_bounding_verts(shell_corners + panel_corners)
+        new_center = Geometry.get_bounding_center([min_v, max_v])
+        self._sub_positions = [p - new_center for p in self._sub_positions]
+        self.size = max_v - min_v
+
+    @property
+    def stack_size(self):
+        return self.size.x * self.scale.x
+
+    def scale_along_stack(self, factor: float):
+        self.scale *= Vector((factor, 1))
+
+    def do_instance(self, build: 'Building', location: Vector, scale: Vector, normal: Vector, direction):
+        mirror_vec = Vector((-1 if self.mirror_x else 1, -1 if self.mirror_y else 1))
+        for panel, sub_loc in zip(self._sub_panels, self._sub_positions):
+            sub_loc *= self.scale * scale * mirror_vec
+            sub_loc_3d = direction * sub_loc.x + Vector((0, 0, sub_loc.y))
+            panel.do_instance(build, location + sub_loc_3d, scale * self.scale * mirror_vec, normal, direction)
+
+    def has_sub_panels(self) -> bool:
+        return bool(self._sub_panels)
 
 
 class Floor(Shape):
@@ -1978,7 +2107,7 @@ class Floor(Shape):
             size_x = panel.stack_size * p_xy_factor
             z_scale = self.stack_size / panel.size.y * z_factor
             xy_shift += size_x / 2
-            panel.do_instance(build, start + direction * xy_shift, Vector((p_xy_factor, z_scale)), normal)
+            panel.do_instance(build, start + direction * xy_shift, Vector((p_xy_factor, z_scale)), normal, direction)
             xy_shift += size_x / 2
 
     def __repr__(self):
@@ -2219,8 +2348,6 @@ class Facade:
             current_range = DistSlice(current_range.stop, current_range.stop)
 
             for face_i, panels_range in first_panel_cells:
-                # if face_i == 54:
-                #     breakpoint()
                 face = build._base_bm.faces[face_i]
                 start, max_l = Geometry.get_bounding_loops(face)
                 direction = Vector((0, 0, 1))
@@ -2377,15 +2504,20 @@ class CentredMeshGrid:
 
 class Geometry:
     @staticmethod
-    def get_bounding_verts(verts: list[BMVert]) -> tuple[Vector, Vector]:  # min, max
-        min_v = Vector((min(v.co.x for v in verts), min(v.co.y for v in verts),
-                        min(v.co.z for v in verts)))
-        max_v = Vector((max(v.co.x for v in verts), max(v.co.y for v in verts),
-                        max(v.co.z for v in verts)))
+    def get_bounding_verts(verts: list[Vector]) -> tuple[Vector, Vector]:  # min, max
+        dim = len(verts[0])
+        if dim == 3:
+            min_v = Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
+            max_v = Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
+        elif dim == 2:
+            min_v = Vector((min(v.x for v in verts), min(v.y for v in verts)))
+            max_v = Vector((max(v.x for v in verts), max(v.y for v in verts)))
+        else:
+            raise TypeError(f"Vectors of size 2 or 3 are expected, size:{dim} is given")
         return min_v, max_v
 
     @staticmethod
-    def get_bounding_center(verts: list[BMVert]) -> Vector:
+    def get_bounding_center(verts: list[Vector]) -> Vector:
         min_v, max_v = Geometry.get_bounding_verts(verts)
         return (max_v - min_v) * 0.5 + min_v
 
