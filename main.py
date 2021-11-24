@@ -1061,7 +1061,7 @@ class FloorPatternNode(BaseNode, Node):
                 else:
                     floor.height = max((p.size.y for p in pan_stack), default=0)
                 pan_stack.fit_scale()
-                return floor
+                return [floor]
 
         return floor_gen
 
@@ -1135,7 +1135,7 @@ class FloorSwitchNode(BaseNode, Node):
                         depth.update(facade.depth)
                     facade.depth = depth.copy()
                     floor = true_floor or (c := catch[inputs.true_floor]) and c.copy(facade) or inputs.true_floor(facade)
-                    return floor
+                    return [floor]
             else:
                 if inputs.false_floor:
                     false_floor = None
@@ -1146,7 +1146,7 @@ class FloorSwitchNode(BaseNode, Node):
                         depth.update(facade.depth)
                     facade.depth = depth.copy()
                     floor = false_floor or (c := catch[inputs.false_floor]) and c.copy(facade) or inputs.false_floor(facade)
-                    return floor
+                    return [floor]
 
         return switch_floor
 
@@ -1169,9 +1169,9 @@ class ChainFloorsNode(BaseNode, Node):
             shift_floor_ind = count()
             for floor_f in inputs[:0:-1]:
                 facade.cur_floor_ind += next(shift_floor_ind)
-                floor = floor_f(facade)
-                if floor:
-                    floors_chain.append(floor)
+                floors = floor_f(facade)
+                if floors:
+                    floors_chain.extend(floors)
             return floors_chain
         return chain_floors
 
@@ -1217,47 +1217,45 @@ class FacadePatternNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         def facade_generator(facade: Facade):
+
+            def get_floors(func, ind=None) -> list:
+                if ind is None:
+                    ind = len(facade.floors_stack)
+                _floors = []
+                if func:
+                    for _ in range(10):
+                        facade.cur_floor_ind = ind
+                        _floors = func(facade)
+                        if _floors:
+                            break
+                return _floors
+
             floors_stack = facade.floors_stack
 
             # generate floors
             if inputs.first:
-                facade.cur_floor_ind = len(facade.floors_stack)
-                floor = inputs.first(facade)
-                if floor:
-                    if isinstance(floor, list):
-                        floors_stack.extend(floor)
-                    else:
-                        floors_stack.append(floor)
+                floors = get_floors(inputs.first)
+                if floors:
+                    last_floors = get_floors(inputs.last, len(facade.floors_stack) + len(floors))
+                    floors_size = sum(f.stack_size for f in floors) + sum(lf.stack_size for lf in last_floors)
+                    if floors_stack.max_width > floors_stack.width + floors_size:
+                        floors_stack.extend(floors)
             if inputs.fill:
                 for i in range(1000):
-                    for _ in range(10):
-                        facade.cur_floor_ind = len(facade.floors_stack)
-                        floor = inputs.fill(facade)
-                        if floor:
-                            break
-                    if not floor:
+                    floors = get_floors(inputs.fill)
+                    if not floors:
                         break
-                    try:
-                        if isinstance(floor, list):
-                            floors_stack.extend(floor)
-                        else:
-                            floors_stack.append(floor)
-                    except IndexError:
+
+                    last_floors = get_floors(inputs.last, len(facade.floors_stack) + len(floors))
+                    floors_size = sum(f.stack_size for f in floors) + sum(lf.stack_size for lf in last_floors)
+                    if floors_stack.max_width > floors_stack.width + floors_size:
+                        floors_stack.extend(floors)
+                    else:
                         break
-            if inputs.last:
-                facade.cur_floor_ind = len(facade.floors_stack) - 1
-                floor = inputs.last(facade)
-                if not isinstance(floor, list):
-                    floor = [floor]
-                size = sum(f.stack_size for f in floor)
-                overlapping = floors_stack[DistSlice(floors_stack.max_width - size, None)]
-                if len(overlapping) != 1:
-                    facade.cur_floor_ind = len(facade.floors_stack) - len(overlapping)
-                    floor = inputs.last(facade)
-                    if not isinstance(floor, list):
-                        floor = [floor]
-                    size = sum(f.stack_size for f in floor)
-                floors_stack.replace(floor, DistSlice(floors_stack.max_width - size, None))
+            try:
+                floors_stack.extend(get_floors(inputs.last))
+            except IndexError:
+                pass
 
             if floors_stack:
                 floors_stack.fit_scale()
