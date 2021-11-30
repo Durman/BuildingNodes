@@ -74,8 +74,9 @@ class BuildingStyleTree(NodeTree):
         gn_tree = obj_props.get_gn_tree()
 
         # set position and attributes
-        if obj_props.points is None:
+        if obj_props.points is None or obj_props.points['owner_name'] != obj.name:
             obj_props.points = bpy.data.objects.new('Points', bpy.data.meshes.new('Points'))
+            obj_props.points['owner_name'] = obj.name
         if obj.mode == 'EDIT':
             bm = bmesh.from_edit_mesh(obj.data)
         else:
@@ -1085,6 +1086,8 @@ class FloorPatternNode(BaseNode, Node):
                 if is_full:
                     pan_stack.fit_scale()
                 return [floor]
+            else:
+                return []
 
         return floor_gen
 
@@ -1416,13 +1419,14 @@ class FacadeAttributesNode(BaseNode, Node):
     bl_idname = 'bn_FacadeAttributesNode'
     bl_label = 'Facade Attributes'
     category = Categories.FACADE
-    Outputs = namedtuple('Outputs', ['left_angle', 'right_angle', 'azimuth', 'mat_id', 'facade_index'])
+    Outputs = namedtuple('Outputs', ['left_angle', 'right_angle', 'azimuth', 'mat_id', 'facade_index', 'length'])
     output_template = Outputs(
         SocketTemplate(FloatSocket, 'Left corner angle', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Right corner angle', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Azimuth', display_shape='DIAMOND'),
         SocketTemplate(IntSocket, 'Material index', display_shape='DIAMOND'),
         SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND'),
+        SocketTemplate(FloatSocket, 'Length', display_shape='DIAMOND'),
     )
 
     @staticmethod
@@ -1441,7 +1445,10 @@ class FacadeAttributesNode(BaseNode, Node):
 
         def facade_index(facade: Facade):
             return facade.index
-        return left_corner_angle, right_corner_angle, azimuth, material_id, facade_index
+
+        def facade_length(facade: Facade):
+            return facade.size.x
+        return left_corner_angle, right_corner_angle, azimuth, material_id, facade_index, facade_length
 
 
 class SetFacadeAttributeNode(BaseNode, Node):
@@ -1620,7 +1627,7 @@ class PanelPanel(Panel):
 
 
 class GeometryTreeInterface:
-    VERSION = "0.10"
+    VERSION = "0.11"
     VERSION_KEY = 'bn_version'
 
     def __init__(self, obj, tree=None):
@@ -1637,23 +1644,13 @@ class GeometryTreeInterface:
         elif tree[self.VERSION_KEY] != self.VERSION:
             self._arrange_tree(tree, obj)
             tree[self.VERSION_KEY] = self.VERSION
-        self._tree = tree
+        self._obj = obj
 
     def set_points(self, obj: bpy.types.Object):
-        obj_node = None
-        for n in self._tree.nodes:
-            if n.bl_idname == 'GeometryNodeObjectInfo':
-                obj_node = n
-                break
-        obj_node.inputs[0].default_value = obj
+        self._obj.modifiers['BuildingStyle']["Input_6"] = obj
 
     def set_instances(self, col: bpy.types.Collection):
-        col_node = None
-        for n in self._tree.nodes:
-            if n.bl_idname == 'GeometryNodeCollectionInfo':
-                col_node = n
-                break
-        col_node.inputs[0].default_value = col
+        self._obj.modifiers['BuildingStyle']["Input_7"] = col
 
     @classmethod
     def is_hostage_tree(cls, tree) -> bool:
@@ -1690,6 +1687,8 @@ class GeometryTreeInterface:
         tree.links.new(inst_n.inputs['Scale'], in_n.outputs[2])
         tree.links.new(del_n.inputs['Selection'], in_n.outputs[3])
         tree.links.new(inst_n.inputs['Instance Index'], in_n.outputs[4])
+        tree.links.new(obj_n.inputs[0], in_n.outputs[5])  # <- points  "Input_6"
+        tree.links.new(col_n.inputs[0], in_n.outputs[6])  # <- panels  "Input_7"
         tree.links.new(join_n.inputs[0], inst_n.outputs[0])
         tree.links.new(out_n.inputs[0], join_n.outputs[0])
 
@@ -1772,7 +1771,7 @@ class ObjectProperties(PropertyGroup):
 
     building_style: bpy.props.PointerProperty(
         type=bpy.types.NodeTree, poll=is_building_tree, name="Building Style", update=update_style)
-    points: bpy.props.PointerProperty(type=bpy.types.Object)  # todo should be removed in object copies
+    points: bpy.props.PointerProperty(type=bpy.types.Object)
     error: bpy.props.StringProperty()
     show_in_edit_mode: bpy.props.BoolProperty(
         default=True, description="Show building style in edit mode", update=update_show_in_edit)
@@ -2056,6 +2055,24 @@ class EditPanelAttributesOperator(Operator):
             props: ObjectProperties = fac_obj.building_props
             if obj in {panel for panel in props.building_style.inst_col.objects}:
                 props.apply_style()
+        return {'FINISHED'}
+
+
+class LinkBuildingStyleOperator(Operator):
+    bl_idname = "bn.link_building_style"
+    bl_label = "Link Building Style"
+
+    @classmethod
+    def pool(cls, context):
+        return bool(context.object)
+
+    def execute(self, context):
+        selected = context.selected_objects
+        active = context.object
+        style_tree = active.building_props.building_style
+        for obj in selected:
+            if obj != active:
+                obj.building_props.building_style = style_tree
         return {'FINISHED'}
 
 
@@ -2845,6 +2862,10 @@ class Geometry:
         return gr
 
 
+def transfer_data_menu(self, context):
+    self.layout.operator(LinkBuildingStyleOperator.bl_idname, icon='HOME')
+
+
 def update_tree_timer():
     if BuildingStyleTree.was_changes:
         update_trees = []
@@ -2918,6 +2939,8 @@ def register():
     bpy.app.handlers.depsgraph_update_post.append(update_active_object)
     bpy.app.handlers.load_post.append(update_tree_timer)  # this is hack to store function somewhere
     bpy.app.timers.register(update_tree_timer, persistent=True)
+    bpy.app.handlers.load_post.append(transfer_data_menu)  # this is hack to store function somewhere
+    bpy.types.VIEW3D_MT_make_links.append(transfer_data_menu)
     for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
         tree.update_sockets()  # todo should be used on file loading
 
@@ -2943,6 +2966,14 @@ def unregister():
         nodeitems_utils.unregister_node_categories('CUSTOM_NODES')
     except KeyError:
         pass
+    try:
+        fun_ind = [f.__name__ for f in bpy.app.handlers.load_post].index(transfer_data_menu.__name__)
+        fun = bpy.app.handlers.load_post[fun_ind]
+    except ValueError:
+        pass
+    else:
+        bpy.app.handlers.load_post.remove(fun)
+        bpy.types.VIEW3D_MT_make_links.remove(fun)
 
     for cls in reversed(classes):
         real_cls = cls.__base__.bl_rna_get_subclass_py(cls.__name__)
