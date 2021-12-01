@@ -68,6 +68,41 @@ class BuildingStyleTree(NodeTree):
     def update(self):
         BuildingStyleTree.was_changes = True
         self.was_changed = True
+        self.check_reroutes_sockets()
+
+    def check_reroutes_sockets(self):
+        if not any(n.bl_idname == 'NodeReroute' for n in self.nodes):
+            return
+
+        # analytical part, it's impossible to use Tree structure and modify the tree
+        Req = namedtuple('Req', ['left_s', 'type', 'shape', 'reroute'])
+        socket_job: dict[NodeSocket, Req] = dict()
+        for node, left_ss in self.walk():  # walk is sorted in case if reroute nodes are going one after other
+            if node.bl_idname == 'NodeReroute' and left_ss and left_ss[0] is not None:
+                left_s, *_ = left_ss
+                if left_s in socket_job:
+                    s_type = socket_job[left_s].type
+                    s_shape = socket_job[left_s].shape
+                else:
+                    s_type = left_s.bl_idname
+                    s_shape = left_s.display_shape
+                if s_type != node.inputs[0].bl_idname or s_shape != node.inputs[0].display_shape:
+                    socket_job[node.outputs[0]] = Req(left_s, s_type, s_shape, node)
+
+        # regenerating sockets
+        for props in reversed(socket_job.values()):
+            # handle input socket
+            in_s = props.reroute.inputs.new(props.type, props.left_s.name)
+            in_s.display_shape = props.shape
+            self.links.new(in_s, props.left_s)
+            props.reroute.inputs.remove(props.reroute.inputs[0])
+
+            # handle output sockets
+            out_s = props.reroute.outputs.new(props.type, props.left_s.name)
+            out_s.display_shape = props.shape
+            for right_s in (l.to_socket for l in props.reroute.outputs[0].links):
+                self.links.new(right_s, out_s)
+            props.reroute.outputs.remove(props.reroute.outputs[0])
 
     def apply(self, obj):
         obj_props: ObjectProperties = obj.building_props
@@ -115,7 +150,9 @@ class BuildingStyleTree(NodeTree):
 
             is_last_node = node.bl_idname == BuildingStyleNode.bl_idname
             # collect properties
-            if is_last_node:
+            if node.bl_idname == 'NodeReroute':
+                pass
+            elif is_last_node:
                 props = base_bm
             elif node.props_template:
                 props = node.props_template
@@ -125,12 +162,18 @@ class BuildingStyleTree(NodeTree):
                 props = None
 
             # find inputs mapping
-            if node.input_template:  # this says that sockets have appropriate identifiers
+            if node.bl_idname == 'NodeReroute':
+                pass
+            elif node.input_template:  # this says that sockets have appropriate identifiers
                 input_data = node.Inputs(*[in_data[key] for key in node.Inputs._fields])  # key words
             else:  # positional
                 input_data = (Inp := node.gen_input_mapping()) and Inp(*in_data.values())
 
-            res = node.execute(input_data, props)
+            if node.bl_idname == 'NodeReroute':
+                res = in_data[node.inputs[0].identifier]
+            else:
+                res = node.execute(input_data, props)
+
             if is_last_node:
                 return res
             if not isinstance(res, tuple):
@@ -203,7 +246,7 @@ class BuildingStyleTree(NodeTree):
 
         return self.inst_col
 
-    def walk(self):  # todo support reroutes
+    def walk(self) -> Iterable[tuple[Node, list[Optional[NodeSocket]]]]:
         node_graph = defaultdict(set)
         prev_sock = dict()
         for link in (l for l in self.links if not l.is_muted):
@@ -238,7 +281,7 @@ class BuildingStyleTree(NodeTree):
         - adding sockets from a template which identifier was not found in a sockets collection
         - marking sockets as deprecated which identifiers are not found in a template
         """
-        for node in self.nodes:
+        for node in (n for n in self.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame'}):
             if node.input_template:
                 socks = {s.identifier: s for s in node.inputs}
                 for pos, (key, template) in enumerate(zip(node.input_template._fields, node.input_template)):
@@ -1061,10 +1104,10 @@ class FloorPatternNode(BaseNode, Node):
             if inputs.fill:
                 for _ in range(10000):
                     panel = get_panel(inputs.fill)
-                    if isclose(panel.size.x, 0, abs_tol=0.001):
-                        raise RuntimeError(f"The width of some panel is too small")
                     if panel is None:
                         break
+                    if isclose(panel.size.x, 0, abs_tol=0.001):
+                        raise RuntimeError(f"The width of some panel is too small")
                     try:
                         pan_stack.append(panel)
                     except IndexError:
@@ -1137,42 +1180,34 @@ class FloorSwitchNode(BaseNode, Node):
         last_facade = None
 
         def switch_floor(facade: Facade):
+            def get_input(func):
+                if func is None:
+                    return None
+                elif func not in catch:
+                    facade.depth.clear()
+                    sock_input = func(facade)
+                    catch[func] = None if facade.depth else sock_input
+                    depth.update(facade.depth)
+                    return sock_input
+                elif (sock_input := catch[func]) is not None:
+                    try:
+                        return [f.copy(facade) for f in sock_input]
+                    except TypeError:
+                        return sock_input
+                else:
+                    return func(facade)
+
             if inputs.bool is None:
-                return
+                return []
             nonlocal last_facade
             if facade != last_facade:  # the catch should exist per facade
                 last_facade = facade
                 catch.clear()
                 depth.clear()
-            switch_state = None
-            if inputs.bool not in catch:
-                facade.depth.clear()
-                switch_state = inputs.bool(facade)
-                catch[inputs.bool] = None if facade.depth else switch_state
-                depth.update(facade.depth)
-            return_true = switch_state or catch[inputs.bool] or inputs.bool(facade)
-            if return_true:
-                if inputs.true_floor:
-                    true_floor = None
-                    if inputs.true_floor not in catch:
-                        facade.depth.clear()
-                        true_floor = inputs.true_floor(facade)
-                        catch[inputs.true_floor] = None if facade.depth else true_floor
-                        depth.update(facade.depth)
-                    facade.depth = depth.copy()
-                    floor = true_floor or (c := catch[inputs.true_floor]) and c.copy(facade) or inputs.true_floor(facade)
-                    return [floor]
-            else:
-                if inputs.false_floor:
-                    false_floor = None
-                    if inputs.false_floor not in catch:
-                        facade.depth.clear()
-                        false_floor = inputs.false_floor(facade)
-                        catch[inputs.false_floor] = None if facade.depth else false_floor
-                        depth.update(facade.depth)
-                    facade.depth = depth.copy()
-                    floor = false_floor or (c := catch[inputs.false_floor]) and c.copy(facade) or inputs.false_floor(facade)
-                    return [floor]
+
+            floors = get_input(inputs.true_floor) if get_input(inputs.bool) else get_input(inputs.false_floor)
+            facade.depth = depth.copy()  # should be last
+            return floors or []
 
         return switch_floor
 
@@ -1181,7 +1216,7 @@ class ChainFloorsNode(BaseNode, Node):
     bl_idname = 'bn_ChainFloorsNode'
     bl_label = "Chain Floors"
     category = Categories.FLOOR
-    repeat_first_socket = True
+    repeat_last_socket = True
     Inputs = namedtuple('Inputs', ['floor0', 'floor1', 'floor2', 'floor3'])
 
     def node_init(self):
@@ -1193,7 +1228,7 @@ class ChainFloorsNode(BaseNode, Node):
         def chain_floors(facade: Facade):
             floors_chain = []
             shift_floor_ind = count()
-            for floor_f in inputs[:0:-1]:
+            for floor_f in filter(bool, inputs[::-1]):
                 facade.cur_floor_ind += next(shift_floor_ind)
                 floors = floor_f(facade)
                 if floors:
@@ -1362,8 +1397,8 @@ class FacadePatternNode(BaseNode, Node):
                     ind = len(facade.floors_stack)
                 _floors = []
                 if func:
-                    for _ in range(10):
-                        facade.cur_floor_ind = ind
+                    for i in range(10):
+                        facade.cur_floor_ind = ind + i
                         _floors = func(facade)
                         if _floors:
                             break
@@ -1507,8 +1542,7 @@ class MathNode(BaseNode, Node):
         self.id_data.update()
 
     mode: bpy.props.EnumProperty(
-        items=[(i.lower(), i, '') for i in [
-            'Add', 'Multiply', 'Grater_than', 'Less_than', 'Remainder', 'Is_close', 'And', 'Or']],
+        items=[(i.lower(), i, '') for i in ['Add', 'Multiply', 'Remainder', 'And', 'Or']],
         update=update_mode,
     )
 
@@ -1529,10 +1563,7 @@ class MathNode(BaseNode, Node):
         funcs = {
             'add': lambda v1, v2, _: v1 + v2,
             'multiply': lambda v1, v2, _: v1 * v2,
-            'grater_than': lambda v1, v2, _: v1 > v2,
-            'less_than': lambda v1, v2, _: v1 < v2,
             'remainder': lambda v1, v2, _: v1 % v2,
-            'is_close': lambda v1, v2, v3: isclose(v1, v2, abs_tol=v3),
             'and': lambda v1, v2, _: bool(v1) and bool(v2),
             'or': lambda v1, v2, _: bool(v1) or bool(v2),
         }
@@ -1561,6 +1592,48 @@ class IntegerValueNode(BaseNode, Node):
         def get_integer(facade: Facade):
             return inputs.value(facade)
         return get_integer
+
+
+class CompareValuesNode(BaseNode, Node):
+    bl_idname = "bn_CompareValuesNode"
+    bl_label = "Compare Values"
+    Inputs = namedtuple('Inputs', ['value1', 'value2', 'tolerance'])
+    input_template = Inputs(
+        SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'),
+        SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'),
+        SocketTemplate(FloatSocket, 'Tolerance', enabled=False, display_shape='DIAMOND_DOT', default_value=0.01),
+    )
+    Outputs = namedtuple('Outputs', ['value'])
+    output_template = Outputs(SocketTemplate(BoolSocket, display_shape='DIAMOND_DOT'))
+    Props = namedtuple('Props', ['mode'])
+
+    def update_mode(self, context):
+        self.get_socket('tolerance', True).enabled = self.mode == 'is_close'
+        self.id_data.update()
+
+    mode: EnumProperty(
+        items=[(i, i.capitalize().replace('_', ' '), '') for i in [
+            'equal', 'is_close', 'not_equal', 'grater_than', 'grater_or_equal', 'less_than', 'less_or_equal']],
+        update=update_mode)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "mode", text='')
+
+    @staticmethod
+    def execute(inputs: Inputs, props: Props):
+        funcs = {
+            'equal': lambda v1, v2, v3: v1 == v2,
+            'is_close': lambda v1, v2, v3: isclose(v1, v2, abs_tol=v3),
+            'not_equal': lambda v1, v2, v3: v1 != v2,
+            'grater_than': lambda v1, v2, _: v1 > v2,
+            'grater_or_equal': lambda v1, v2, _: v1 >= v2,
+            'less_than': lambda v1, v2, _: v1 < v2,
+            'less_or_equal': lambda v1, v2, _: v1 <= v2,
+        }
+
+        def compare_values(facade: Facade):
+            return funcs[props.mode](inputs.value1(facade), inputs.value2(facade), inputs.tolerance(facade))
+        return compare_values
 
 
 class ObjectPanel(Panel):
@@ -2983,7 +3056,7 @@ def unregister():
 
 def _update_colors():
     for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
-        for node in tree.nodes:
+        for node in (n for n in tree.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame'}):
             if node.category is not None:
                 node.use_custom_color = True
                 node.color = node.category.color
