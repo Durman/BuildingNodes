@@ -31,6 +31,7 @@ from nodeitems_utils import NodeCategory, NodeItem
 
 
 FACE_STYLE_LAYER_NAME = "BnStyleName"  # should be unchanged between versions
+VERSION = (0, 1)
 
 
 def profile(fun=None, *, sort: Literal['time', 'cumulative'] = 'time', length=10, file: Path = None):
@@ -140,13 +141,13 @@ class BuildingStyleTree(NodeTree):
             in_data = dict()
             for from_sock, to_sock in zip(prev_socks, node.inputs):
                 if from_sock is not None:
-                    in_data[to_sock.identifier] = sock_data[from_sock]
+                    in_data[to_sock.py_identifier] = sock_data[from_sock]
                 elif hasattr(to_sock, 'value'):
                     def sock_value(build, *, _value=to_sock.value):
                         return _value
-                    in_data[to_sock.identifier] = sock_value
+                    in_data[to_sock.py_identifier] = sock_value
                 else:
-                    in_data[to_sock.identifier] = None
+                    in_data[to_sock.py_identifier] = None
 
             is_last_node = node.bl_idname == BuildingStyleNode.bl_idname
             # collect properties
@@ -165,7 +166,8 @@ class BuildingStyleTree(NodeTree):
             if node.bl_idname == 'NodeReroute':
                 pass
             elif node.input_template:  # this says that sockets have appropriate identifiers
-                input_data = node.Inputs(*[in_data[key] for key in node.Inputs._fields])  # key words
+                mapping = node.gen_input_mapping()
+                input_data = mapping(*[in_data[key] for key in mapping._fields])  # key words
             else:  # positional
                 input_data = (Inp := node.gen_input_mapping()) and Inp(*in_data.values())
 
@@ -284,12 +286,22 @@ class BuildingStyleTree(NodeTree):
         for node in (n for n in self.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame'}):
             if node.input_template:
                 socks = {s.identifier: s for s in node.inputs}
-                for pos, (key, template) in enumerate(zip(node.input_template._fields, node.input_template)):
+                if node.repeat_last_socket:
+                    sock_keys = node.input_template._fields[:-1]
+                    sock_templates = node.input_template[:-1]
+                else:
+                    sock_keys = node.input_template._fields
+                    sock_templates = node.input_template
+                for pos, (key, template) in enumerate(zip(sock_keys, sock_templates)):
                     if key not in socks:
                         template.init(node, is_input=True, identifier=key)
                         node.inputs.move(len(node.inputs) - 1, pos)
                 for key, sock in socks.items():
                     is_deprecated = not hasattr(node.input_template, key)
+                    if is_deprecated and node.repeat_last_socket:
+                        if sock.bl_idname in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname}:
+                            if sock.bl_idname == node.inputs[-1].bl_idname:
+                                is_deprecated = False
                     sock.is_deprecated = is_deprecated
                     if is_deprecated:
                         sock.enabled = True
@@ -366,6 +378,10 @@ class BaseSocket:
             if sock.identifier == self.identifier:
                 return ind
         raise LookupError
+
+    @property
+    def py_identifier(self):
+        return self.identifier.replace('.', '')
 
 
 class FacadeSocket(BaseSocket, NodeSocket):
@@ -470,6 +486,22 @@ class Vector4Socket(BaseSocket, NodeSocket):
     value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value, size=4)
 
 
+class EnumSocket(BaseSocket, NodeSocket):
+    bl_idname = 'bn_EnumSocket'
+    bl_lable = "Enum Socket"
+    default_name = "Enum"
+    color = 0, 0.3, 0, 1
+
+    def eval_items(self, context):
+        try:
+            return eval(self.items_ref)
+        except (NameError, AttributeError):
+            return [('ERROR', 'ERROR', '')]
+
+    value: EnumProperty(items=eval_items, update=BaseSocket.update_value)
+    items_ref: StringProperty(description="Path to the items")
+
+
 class Categories(Enum):
     BUILDING = auto()
     FACADE = auto()
@@ -509,6 +541,7 @@ class SocketTemplate(NamedTuple):
     enabled: bool = True
     display_shape: Literal['CIRCLE', 'SQUARE', 'DIAMOND', 'CIRCLE_DOT', 'SQUARE_DOT', 'DIAMOND_DOT'] = None
     default_value: Any = None
+    items_ref: str = None
 
     def init(self, node: Node, is_input, identifier=None):
         node_sockets = node.inputs if is_input else node.outputs
@@ -519,10 +552,12 @@ class SocketTemplate(NamedTuple):
             sock.display_shape = self.display_shape
         if self.default_value is not None:
             sock.value = self.default_value
+        if self.type == EnumSocket:
+            sock.items_ref = self.items_ref
 
 
 class NodeSettingsOperator:
-    bl_label = "Edit the node options"
+    bl_label = "Node settings"
     bl_options = {'INTERNAL', }
     panel_props = []
     floor_props = []
@@ -587,17 +622,14 @@ class NodeSettingsOperator:
         col.alignment = 'RIGHT'
         row = col.row()
         row.label(text='Node properties value')
+        row = row.row(align=True)
         row.alignment = 'RIGHT'
         row.label(text='Show')
         for sock in node.inputs:
-            if not sock.is_linked:
+            if not sock.is_linked and hasattr(sock, 'value'):
                 row = col.row()
-                if hasattr(sock, 'value'):
-                    row.prop(sock, 'value', text=sock.user_name or sock.name or sock.default_name)
-                    row.prop(sock, 'is_to_show', text='')
-                else:
-                    row.label(text=sock.name or sock.default_name)
-                    row.prop(sock, 'is_to_show', text='')
+                row.prop(sock, 'value', text=sock.user_name or sock.name or sock.default_name)
+                row.prop(sock, 'is_to_show', text='')
 
     @staticmethod
     def draw_remote_props(layout, node, props_type: Literal['PANEL', 'FLOOR'], sock_identifiers: list):
@@ -621,7 +653,6 @@ class NodeSettingsOperator:
 class BaseNode:
     category: Categories = None
     repeat_last_socket = False
-    repeat_first_socket = False
     input_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
     output_template: tuple[SocketTemplate] = []  # only for static sockets, cause it is used for checking sockets API
     props_template: tuple = []
@@ -634,6 +665,7 @@ class BaseNode:
 
     def init(self, context):
         # update node colors
+        self['version'] = VERSION
         if self.category is not None:
             self.use_custom_color = True
             self.color = self.category.color
@@ -657,19 +689,15 @@ class BaseNode:
         links = {l.to_socket: l for l in self.id_data.links}
         if self.repeat_last_socket:
             sock_id_name = self.inputs[-1].bl_idname
-            if self.inputs[-1].is_linked:
-                self.inputs.new(sock_id_name, "")
-            for socket in list(self.inputs)[-2::-1]:
-                if socket.bl_idname == self.inputs[-1].bl_idname and socket not in links:
-                    self.inputs.remove(socket)
-        if self.repeat_first_socket:
-            sock_id_name = self.inputs[0].bl_idname
-            if self.inputs[0].is_linked:
-                s = self.inputs.new(sock_id_name, "")
-                self.inputs.move(len(self.inputs) - 1, 0)
-            for socket in list(self.inputs)[:0:-1]:
-                if socket.bl_idname == self.inputs[0].bl_idname and not socket.is_linked:
-                    self.inputs.remove(socket)
+            if sock_id_name in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname}:
+                if self.inputs[-1].is_linked:
+                    identifier = self.input_template._fields[-1] if self.input_template else ''
+                    self.inputs.new(sock_id_name, "", identifier=identifier)
+                for low_sock, up_sock in zip(list(self.inputs)[::-1], list(self.inputs)[-2::-1]):
+                    if up_sock in links or up_sock.bl_idname != sock_id_name:
+                        break
+                    if low_sock.bl_idname == sock_id_name and low_sock not in links:
+                        self.inputs.remove(low_sock)
 
         self.node_update()
 
@@ -681,7 +709,19 @@ class BaseNode:
         pass
 
     def gen_input_mapping(self) -> Optional[Type[NamedTuple]]:
-        if self.repeat_last_socket or self.repeat_first_socket:
+        if self.input_template:  # this says that sockets have appropriate identifiers
+            pos_identifiers = []
+            key_identifiers = self.Inputs._fields
+            if self.repeat_last_socket:  # there are extra socket not presented in the template
+                for sock in reversed(self.inputs):
+                    if sock.bl_idname == self.inputs[-1].bl_idname:
+                        pos_identifiers.append(sock.py_identifier)
+                    else:
+                        break
+                pos_identifiers.reverse()
+                key_identifiers = key_identifiers[:-1]
+            return namedtuple('Inputs', chain(key_identifiers, pos_identifiers))  # key words
+        elif self.repeat_last_socket:
             input_names = []
             index = count()
             for sock in self.inputs:
