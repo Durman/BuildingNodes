@@ -325,14 +325,17 @@ class BaseSocket:
 
     def update_is_to_show(self, context):
         self.enabled = self.is_to_show
-        self.update_value(context)
+        # self.update_value(context)
 
     user_name: bpy.props.StringProperty(description="Socket name given by user")  # todo tag redraw
     is_deprecated: bpy.props.BoolProperty(description="In case the socket is not used by a node any more")
     is_to_show: bpy.props.BoolProperty(
         default=True, description="To display the socket in node interface", update=update_is_to_show)
+    update_ref: StringProperty(description="Path to the update function for value property")
 
     def update_value(self, context):
+        if self.update_ref:
+            eval(self.update_ref)(self, context)
         self.id_data.update()  # https://developer.blender.org/T92635
 
     def draw(self, context, layout, node, text):
@@ -348,7 +351,7 @@ class BaseSocket:
             col = layout.column()
             col.prop(self, 'value', text=(self.user_name or text or self.default_name) if self.show_text else '')
 
-        elif self.node.main_prop:
+        elif self.is_output and self.node.main_prop:
             row = layout.row(align=True)
             sock = self.node.get_socket(self.node.main_prop, is_input=True)
             if sock.enabled:
@@ -542,6 +545,7 @@ class SocketTemplate(NamedTuple):
     display_shape: Literal['CIRCLE', 'SQUARE', 'DIAMOND', 'CIRCLE_DOT', 'SQUARE_DOT', 'DIAMOND_DOT'] = None
     default_value: Any = None
     items_ref: str = None
+    update_ref: str = None
 
     def init(self, node: Node, is_input, identifier=None):
         node_sockets = node.inputs if is_input else node.outputs
@@ -554,6 +558,8 @@ class SocketTemplate(NamedTuple):
             sock.value = self.default_value
         if self.type == EnumSocket:
             sock.items_ref = self.items_ref
+        if self.update_ref:
+            sock.update_ref = self.update_ref
 
 
 class NodeSettingsOperator:
@@ -648,6 +654,10 @@ class NodeSettingsOperator:
                     node_label = remote_node.draw_label() if hasattr(remote_node, 'draw_label') else remote_node.bl_label
                     row = col.row()
                     row.prop(socket, 'value', text=f"{node_label}")
+
+
+class DefaultNodeSettings(NodeSettingsOperator, Operator):
+    bl_idname = "bn.default_node_settings"
 
 
 class BaseNode:
@@ -1574,43 +1584,69 @@ class FacadeItemsNode(BaseNode, Node):
 class MathNode(BaseNode, Node):
     bl_idname = 'bn_MathNode'
     bl_label = "Math"
-    Inputs = namedtuple('Inputs', ['val1', 'val2', 'tolerance'])
-    Props = namedtuple('Props', ['mode'])
-
-    def update_mode(self, context):
-        self.inputs['Tolerance'].enabled = self.mode == 'is_close'
-        self.id_data.update()
-
-    mode: bpy.props.EnumProperty(
-        items=[(i.lower(), i, '') for i in ['Add', 'Multiply', 'Remainder', 'And', 'Or']],
-        update=update_mode,
+    Inputs = namedtuple('Inputs', ['operation', 'val1', 'val2'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Operation', False, items_ref='MathNode.operation_items'),
+        SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'),
+        SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'),
     )
-
-    def node_init(self):
-        self.inputs.new(FloatSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
-        self.inputs.new(FloatSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
-        s = self.inputs.new(FloatSocket.bl_idname, "Tolerance")
-        s.display_shape = 'DIAMOND_DOT'
-        s.value = 0.01
-        self.outputs.new(FloatSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
-        self.update_mode(None)
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, "mode", text='')
+    operation_items = [
+        ('add', 'Add', '', 0),
+        ('subtract', 'Subtract', '', 1),
+        ('multiply', 'Multiply', '', 2),
+        ('divide', 'Divide', '', 3),
+        ('remainder', 'Reminder', '', 4),
+    ]
+    Outputs = namedtuple('Outputs', ['value'])
+    output_template = Outputs(SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'))
+    main_prop = 'operation'
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
-    def execute(inputs: Inputs, props: Props):
+    def execute(inputs: Inputs, props):
         funcs = {
-            'add': lambda v1, v2, _: v1 + v2,
-            'multiply': lambda v1, v2, _: v1 * v2,
-            'remainder': lambda v1, v2, _: v1 % v2,
-            'and': lambda v1, v2, _: bool(v1) and bool(v2),
-            'or': lambda v1, v2, _: bool(v1) or bool(v2),
+            'add': lambda v1, v2: v1 + v2,
+            'subtract': lambda v1, v2: v1 - v2,
+            'multiply': lambda v1, v2: v1 * v2,
+            'divide': lambda v1, v2: v1 / v2,
+            'remainder': lambda v1, v2: v1 % v2,
         }
 
-        def math(build):
-            return funcs[props.mode](inputs.val1(build), inputs.val2(build), inputs.tolerance(build))
+        def math(facade):
+            return funcs[inputs.operation(facade)](inputs.val1(facade), inputs.val2(facade))
         return math
+
+
+class BooleanMathNode(BaseNode, Node):
+    bl_idname = "bn_BooleanMathNode"
+    bl_label = "Boolean Math"
+    Inputs = namedtuple('Inputs', ['operation', 'val1', 'val2'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Operation', False, items_ref='BooleanMathNode.operation_items',
+                       update_ref='BooleanMathNode.update_operation'),
+        SocketTemplate(BoolSocket, display_shape='DIAMOND_DOT'),
+        SocketTemplate(BoolSocket, display_shape='DIAMOND_DOT'),
+    )
+    Outputs = namedtuple('Outputs', ['value'])
+    output_template = Outputs(SocketTemplate(BoolSocket, display_shape='DIAMOND_DOT'))
+    operation_items = [(i, i.capitalize().replace('_', ' '), '') for i in ['and', 'or', 'not']]
+    main_prop = 'operation'
+    settings_viewer = DefaultNodeSettings
+
+    def update_operation(self: NodeSocket, context):
+        self.node.get_socket('val2', True).is_to_show = self.value != 'not'
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        funcs = {
+            'and': lambda v1, v2: bool(v1) and bool(v2),
+            'or': lambda v1, v2: bool(v1) or bool(v2),
+            'not': lambda v1, _: not bool(v1),
+        }
+
+        def boolean_math(facade: Facade):
+            return funcs[inputs.operation(facade)](inputs.val1(facade), inputs.val2(facade))
+        return boolean_math
 
 
 class IntegerValueNodeSettings(NodeSettingsOperator, Operator):
@@ -1634,33 +1670,30 @@ class IntegerValueNode(BaseNode, Node):
         return get_integer
 
 
-class CompareValuesNode(BaseNode, Node):
-    bl_idname = "bn_CompareValuesNode"
-    bl_label = "Compare Values"
-    Inputs = namedtuple('Inputs', ['value1', 'value2', 'tolerance'])
+class ComparisonMathNode(BaseNode, Node):
+    bl_idname = "bn_ComparisonMathNode"
+    bl_label = "Comparison Math"
+    Inputs = namedtuple('Inputs', ['operation', 'value1', 'value2', 'tolerance'])
     input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Operation', False, items_ref='ComparisonMathNode.operation_items',
+                       update_ref='ComparisonMathNode.update_mode'),
         SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'),
         SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'),
         SocketTemplate(FloatSocket, 'Tolerance', enabled=False, display_shape='DIAMOND_DOT', default_value=0.01),
     )
     Outputs = namedtuple('Outputs', ['value'])
     output_template = Outputs(SocketTemplate(BoolSocket, display_shape='DIAMOND_DOT'))
-    Props = namedtuple('Props', ['mode'])
 
-    def update_mode(self, context):
-        self.get_socket('tolerance', True).enabled = self.mode == 'is_close'
-        self.id_data.update()
+    def update_mode(self: NodeSocket, context):
+        self.node.get_socket('tolerance', True).is_to_show = self.value == 'is_close'
 
-    mode: EnumProperty(
-        items=[(i, i.capitalize().replace('_', ' '), '') for i in [
-            'equal', 'is_close', 'not_equal', 'grater_than', 'grater_or_equal', 'less_than', 'less_or_equal']],
-        update=update_mode)
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, "mode", text='')
+    operation_items = [(i, i.capitalize().replace('_', ' '), '') for i in [
+        'equal', 'is_close', 'not_equal', 'grater_than', 'grater_or_equal', 'less_than', 'less_or_equal']]
+    main_prop = 'operation'
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
-    def execute(inputs: Inputs, props: Props):
+    def execute(inputs: Inputs, props):
         funcs = {
             'equal': lambda v1, v2, v3: v1 == v2,
             'is_close': lambda v1, v2, v3: isclose(v1, v2, abs_tol=v3),
@@ -1672,7 +1705,7 @@ class CompareValuesNode(BaseNode, Node):
         }
 
         def compare_values(facade: Facade):
-            return funcs[props.mode](inputs.value1(facade), inputs.value2(facade), inputs.tolerance(facade))
+            return funcs[inputs.operation(facade)](inputs.value1(facade), inputs.value2(facade), inputs.tolerance(facade))
         return compare_values
 
 
