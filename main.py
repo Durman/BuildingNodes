@@ -1211,6 +1211,41 @@ class FloorAttributesNode(BaseNode, Node):
         return floor_width, floor_height, floor_index
 
 
+class SelectFloorNode(BaseNode, Node):
+    bl_idname = 'bn_SelectFloorNode'
+    bl_label = 'Select Floor'
+    category = Categories.FLOOR
+    repeat_last_socket = True
+    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'floor'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectFloorNode.mode_items'),
+        SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND_DOT'),
+        SocketTemplate(FloorSocket),
+    )
+    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    Outputs = namedtuple('Outputs', ['floor'])
+    output_template = Outputs(SocketTemplate(FloorSocket))
+    settings_viewer = DefaultNodeSettings
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def select_floor(facade: Facade):
+            func_ind = inputs._fields.index('floor')
+            floor_funcs = {i: f for i, f in enumerate(inputs[func_ind:-1])}
+            mode = inputs.match_mode(facade)
+            if mode == 'NONE':
+                index = inputs.index(facade)
+            elif mode == 'REPEAT':
+                index = min(len(floor_funcs) - 1, inputs.index(facade))
+            elif mode == 'CYCLE':
+                index = inputs.index(facade) % len(floor_funcs)
+            else:
+                raise TypeError(f"Unknown mode {mode}")
+            panel_f = floor_funcs.get(int(index))
+            return panel_f and panel_f(facade) or []
+        return select_floor
+
+
 class FloorSwitchNode(BaseNode, Node):
     bl_idname = 'bn_FloorSwitchNode'
     bl_label = "Floor Switch"
@@ -1504,18 +1539,25 @@ class FacadeAttributesNode(BaseNode, Node):
     bl_idname = 'bn_FacadeAttributesNode'
     bl_label = 'Facade Attributes'
     category = Categories.FACADE
-    Outputs = namedtuple('Outputs', ['left_angle', 'right_angle', 'azimuth', 'mat_id', 'facade_index', 'length'])
+    Outputs = namedtuple('Outputs', ['height', 'length', 'left_angle', 'right_angle', 'azimuth', 'mat_id', 'facade_index'])
     output_template = Outputs(
+        SocketTemplate(FloatSocket, 'Height', display_shape='DIAMOND'),
+        SocketTemplate(FloatSocket, 'Length', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Left corner angle', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Right corner angle', display_shape='DIAMOND'),
         SocketTemplate(FloatSocket, 'Azimuth', display_shape='DIAMOND'),
         SocketTemplate(IntSocket, 'Material index', display_shape='DIAMOND'),
         SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND'),
-        SocketTemplate(FloatSocket, 'Length', display_shape='DIAMOND'),
     )
 
     @staticmethod
     def execute(inputs, props):
+        def facade_height(facade: Facade):
+            return facade.size.y
+
+        def facade_length(facade: Facade):
+            return facade.size.x
+
         def left_corner_angle(facade: Facade):
             return facade.left_wall_angle
 
@@ -1530,10 +1572,7 @@ class FacadeAttributesNode(BaseNode, Node):
 
         def facade_index(facade: Facade):
             return facade.index
-
-        def facade_length(facade: Facade):
-            return facade.size.x
-        return left_corner_angle, right_corner_angle, azimuth, material_id, facade_index, facade_length
+        return facade_height, facade_length, left_corner_angle, right_corner_angle, azimuth, material_id, facade_index
 
 
 class SetFacadeAttributeNode(BaseNode, Node):
@@ -1649,25 +1688,38 @@ class BooleanMathNode(BaseNode, Node):
         return boolean_math
 
 
-class IntegerValueNodeSettings(NodeSettingsOperator, Operator):
-    bl_idname = 'bn.integer_value_node_settings'
-
-
 class IntegerValueNode(BaseNode, Node):
     bl_idname = "bn_IntegerValueNode"
     bl_label = "Integer"
     Inputs = namedtuple('Inputs', ['value'])
-    input_template = Inputs(SocketTemplate(IntSocket, enabled=False))
+    input_template = Inputs(SocketTemplate(IntSocket, enabled=False, display_shape='DIAMOND_DOT'))
     Outputs = namedtuple('Outputs', ['value'])
-    output_template = Outputs(SocketTemplate(IntSocket))
+    output_template = Outputs(SocketTemplate(IntSocket, display_shape='DIAMOND_DOT'))
     main_prop = 'value'
-    settings_viewer = IntegerValueNodeSettings
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
     def execute(inputs: Inputs, props):
         def get_integer(facade: Facade):
             return inputs.value(facade)
         return get_integer
+
+
+class FloatValueNode(BaseNode, Node):
+    bl_idname = "bn_FloatValueNode"
+    bl_label = "Float"
+    Inputs = namedtuple('Inputs', ['value'])
+    input_template = Inputs(SocketTemplate(FloatSocket, enabled=False, display_shape='DIAMOND_DOT'))
+    Outputs = namedtuple('Outputs', ['value'])
+    output_template = Outputs(SocketTemplate(FloatSocket, display_shape='DIAMOND_DOT'))
+    main_prop = 'value'
+    settings_viewer = DefaultNodeSettings
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def get_float(facade: Facade):
+            return inputs.value(facade)
+        return get_float
 
 
 class ComparisonMathNode(BaseNode, Node):
@@ -3088,7 +3140,10 @@ def register():
     bpy.app.handlers.load_post.append(transfer_data_menu)  # this is hack to store function somewhere
     bpy.types.VIEW3D_MT_make_links.append(transfer_data_menu)
     for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
-        tree.update_sockets()  # todo should be used on file loading
+        try:
+            tree.update_sockets()  # todo should be used on file loading
+        except Exception:
+            traceback.print_exc()
 
 
 def unregister():
