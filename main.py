@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from enum import Enum, auto
 from functools import wraps
 from graphlib import TopologicalSorter
-from itertools import count, chain, cycle, repeat, accumulate, compress
+from itertools import count, chain, cycle, repeat, accumulate, compress, dropwhile
 from math import isclose, inf
 from pathlib import Path
 from pstats import Stats
@@ -1049,43 +1049,41 @@ class JoinPanelsNode(BaseNode, Node):
     bl_label = 'Join Panels'
     category = Categories.PANEL
     repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['panel0', 'panel1', 'panel2'])
+    settings_viewer = DefaultNodeSettings
+    Inputs = namedtuple('Inputs', ['align', 'panel'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Align', False, items_ref="JoinPanelsNode.align_items"),
+        SocketTemplate(PanelSocket),
+    )
     Outputs = namedtuple('Outputs', ['panel'])
-    Props = namedtuple('Props', ['align'])
-
-    align: EnumProperty(items=[(i, i.capitalize(), '') for i in ['RIGHT', 'TOP', 'LEFT', 'BOTTOM']],
-                        update=lambda s, c: s.id_data.update())
-
-    def node_init(self):
-        self.inputs.new(PanelSocket.bl_idname, '')
-        self.outputs.new(PanelSocket.bl_idname, '')
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, "align", text='')
+    output_template = Outputs(SocketTemplate(PanelSocket))
+    align_items = [(i, i.capitalize(), '') for i in ['RIGHT', 'TOP', 'LEFT', 'BOTTOM']]
 
     @staticmethod
-    def execute(inputs: Inputs, props: Props):
+    def execute(inputs: Inputs, props):
         def join_panels(facade: Facade):
             shell = PanelShell()
-            for panel_f in inputs:
+            for _, panel_f in dropwhile(lambda inp: inp[0] != 'panel', zip(inputs._fields, inputs)):
                 if panel_f is None:
                     continue
                 panel = panel_f(facade)
                 if not panel:
                     continue
 
+                align = inputs.align(facade)
                 if shell.size == Vector((0, 0)):
                     shell.add_panel(panel, Vector((0, 0)))
-                elif props.align == 'RIGHT':
+                elif align == 'RIGHT':
                     shell.add_panel(panel, Vector((shell.size.x / 2 + panel.size.x / 2, 0)))
-                elif props.align == 'TOP':
+                elif align == 'TOP':
                     shell.add_panel(panel, Vector((0, shell.size.y / 2 + panel.size.y / 2)))
-                elif props.align == 'LEFT':
+                elif align == 'LEFT':
                     shell.add_panel(panel, Vector((-shell.size.x / 2 + -panel.size.x / 2, 0)))
-                elif props.align == 'BOTTOM':
+                elif align == 'BOTTOM':
                     shell.add_panel(panel, Vector((0, -shell.size.y / 2 + -panel.size.y / 2)))
                 else:
                     raise TypeError
+
             if shell.has_sub_panels():
                 return shell
         return join_panels
@@ -2394,7 +2392,10 @@ class PanelShell(Shape):
 
     @property
     def is_scalable(self):
-        return any(p.is_scalable for p in self._sub_panels)
+        if self._sub_panels:
+            return any(p.is_scalable for p in self._sub_panels)
+        else:
+            return True
 
     def add_panel(self, panel: Panel, position: Vector):
         self._sub_panels.append(panel)
@@ -2424,6 +2425,10 @@ class PanelShell(Shape):
 
     def has_sub_panels(self) -> bool:
         return bool(self._sub_panels)
+
+    def __repr__(self):
+        indexes = ','.join([str(p.obj_index) for p in self._sub_panels])
+        return f"<PanelShell:{indexes}>"
 
 
 class Floor(Shape):
