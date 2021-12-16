@@ -759,7 +759,12 @@ class BuildingStyleNode(BaseNode, Node):
         build = Building(base_bm)
         if inputs.facade:
             for facade, grid in build.facades:
-                if inputs.facade(facade):
+                floors_stack: ShapesStack = inputs.facade(facade)
+                if floors_stack:
+                    facade.floors_stack = floors_stack
+                    floors_stack.is_full = isclose(facade.size.y - floors_stack.width, 0, abs_tol=0.001)
+                    for floor in floors_stack:
+                        floor.panels_stack.is_full = isclose(facade.size.x - floor.panels_stack.width, 0, abs_tol=0.001)
                     facade.do_instance(build, grid)
         return build.bm
 
@@ -1099,82 +1104,63 @@ class FloorPatternNode(BaseNode, Node):
     bl_label = "Floor Pattern"
     category = Categories.FLOOR
     settings_viewer = FloorPatternNodeSettings
-    Inputs = namedtuple('Inputs', ['height', 'scalable', 'join_size', 'left', 'fill', 'distribute', 'right'])
+    Inputs = namedtuple('Inputs', ['height', 'length', 'scalable', 'left', 'fill', 'right'])
     input_template = Inputs(
-        SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT', 3),
+        SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT'),
+        SocketTemplate(FloatSocket, 'Length', False, 'DIAMOND_DOT'),
         SocketTemplate(BoolSocket, 'Scalable', False, 'DIAMOND_DOT', True),
-        SocketTemplate(FloatSocket, 'Join Size', False, 'DIAMOND_DOT', 1),
         SocketTemplate(PanelSocket, 'Left'),
         SocketTemplate(PanelSocket, 'Fill'),
-        SocketTemplate(PanelSocket, 'Distribute'),
         SocketTemplate(PanelSocket, 'Right'),
     )
     Outputs = namedtuple('Outputs', ['floor'])
     output_template = Outputs(SocketTemplate(FloorSocket))
-    Props = namedtuple('Props', ['use_height'])
 
-    @property
-    def props_template(self) -> Props:
-        return self.Props(self.get_socket('height', is_input=True).is_to_show)
-
-    @classmethod
-    def execute(cls, inputs: Inputs, props: Props):
+    @staticmethod
+    def execute(inputs: Inputs, props):
         catch = None
 
         def floor_gen(facade: Facade):
-            floor = facade.get_floor()
+            floor = facade.get_floor(facade.request_size.x if (l := inputs.length(facade)) <= 0 else l)
             floor.is_scalable = inputs.scalable(facade)
-            floor.join_size = inputs.join_size(facade)
-            floor.is_infinite = bool(inputs.fill)
 
             if facade.read_props:
                 return [floor]
 
-            def get_panel(func, ind=None) -> Optional[Panel]:
-                if ind is None:
-                    ind = len(pan_stack)
+            def get_panel(func, counter) -> Optional[Panel]:
                 if func:
-                    for _ in range(10):
-                        facade.cur_panel_ind = ind
+                    for fail_ind, try_ind in enumerate(counter):
+                        if fail_ind > 10:
+                            break
+                        facade.cur_panel_ind = try_ind
                         _panel = func(facade)
                         if _panel:
                             return _panel
 
-            is_full = False
             pan_stack = floor.panels_stack
-            if inputs.left:
-                panel = get_panel(inputs.left)
-                if panel:
-                    try:
-                        pan_stack.append(panel)
-                    except IndexError:
-                        is_full = True
-            if inputs.fill:
+            if panel := get_panel(inputs.left, count()):
+                pan_stack.append(panel, throw_error=False)
+            if last_panel := get_panel(inputs.right, count()):
+                pan_stack.append(last_panel, throw_error=False)
+            if not pan_stack.is_full:
+                fill_count = count()
                 for _ in range(10000):
-                    panel = get_panel(inputs.fill)
+                    panel = get_panel(inputs.fill, fill_count)
                     if panel is None:
                         break
                     if isclose(panel.size.x, 0, abs_tol=0.001):
                         raise RuntimeError(f"The width of some panel is too small")
                     try:
-                        pan_stack.append(panel)
+                        if last_panel:
+                            pan_stack.insert(-1, panel)
+                        else:
+                            pan_stack.append(panel)
                     except IndexError:
-                        is_full = True
                         break
-            if inputs.right:
-                panel = get_panel(inputs.right, len(pan_stack) - 1)
-                if panel:
-                    overlapping = pan_stack[DistSlice(pan_stack.max_width - panel.size.x, None)]
-                    if len(overlapping) != 1:
-                        panel = get_panel(inputs.right, len(pan_stack) - len(overlapping))
-                    pan_stack.replace([panel], DistSlice(pan_stack.max_width - panel.size.x, None))
 
             if pan_stack:
-                if props.use_height:
-                    floor.height = inputs.height(facade)
-                else:
-                    floor.height = max((p.size.y for p in pan_stack), default=0)
-                if is_full:
+                floor.height = max((p.size.y for p in pan_stack), default=0) if (h := inputs.height(facade)) <= 0 else h
+                if floor.panels_stack.is_full:
                     pan_stack.fit_scale()
                 return [floor]
             else:
@@ -1325,124 +1311,126 @@ class JoinFloorsNode(BaseNode, Node):
     bl_label = 'Join Floors'
     category = Categories.FLOOR
     repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['floor0', 'floor1', 'floor2'])
-
-    def node_init(self):
-        self.inputs.new(FloorSocket.bl_idname, "")
-        self.outputs.new(FloorSocket.bl_idname, "")
+    Inputs = namedtuple('Inputs', ['match_mode', 'floor'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='JoinFloorsNode.mode_items'),
+        SocketTemplate(FloorSocket),
+    )
+    Outputs = namedtuple('Outputs', ['floor'])
+    output_template = Outputs(SocketTemplate(FloorSocket))
+    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
     def execute(inputs: Inputs, props):
         def join_floors(facade: Facade):
-            # read properties of downstream nodes
-            floor_impacts = []
-            floor_infinity = []
-            for floor_f in filter(bool, inputs):
-                with facade.reading_props():
-                    floor = floor_f(facade)[0]
-                    floor_impacts.append(floor.join_size)
-                    floor_infinity.append(floor.is_infinite)
+            floor: Floor = facade.get_floor(facade.request_size.x)
+            fl_funcs = list(filter(bool, inputs[inputs._fields.index('floor'): -1]))
+            mode = inputs.match_mode(facade)
+            iter_funcs = {'NONE': iter, 'REPEAT': lambda a: chain(a, repeat(a[-1], 1000)), 'CYCLE': cycle}
 
-            # return properties to upstream nodes
-            floor = facade.get_floor()
-            if facade.read_props:
-                floor.join_size = mean(compress(floor_impacts, floor_infinity))
-                floor.is_infinite = any(floor_infinity)
-                return [floor]
+            with facade.size_context():
+                for fl_func in iter_funcs[mode](fl_funcs):
+                    sub_floors: list[Floor] = fl_func(facade)
+                    if sub_floors:
+                        try:
+                            floor.height = max(floor.height or 0, sub_floors[0].height)
+                            floor.panels_stack.extend(list(sub_floors[0].panels_stack))
+                            facade.request_size -= Vector((sub_floors[0].panels_stack.width, 0))
+                        except IndexError:
+                            break
 
-            # generate fixed size floors
-            sub_floors = [None for _ in range(len(floor_impacts))]
-            for i, floor_f in compress(enumerate(filter(bool, inputs)), (not i for i in floor_infinity)):
-                sub_floors[i] = (f := floor_f(facade)) and f[0] or None
-
-            # generate infinite size floors
-            current_size = sum(f.panels_stack.width for f in filter(bool, sub_floors))
-            if current_size < facade.size.x:
-                rest_size = facade.size.x - current_size
-                impact_total = sum(compress(floor_impacts, floor_infinity))
-                for i, (floor_f, impact) in \
-                        compress(enumerate(zip(filter(bool, inputs), floor_impacts)), floor_infinity):
-                    new_size = Vector((rest_size * (impact / impact_total), 0))
-                    sub_facade = Facade(facade.index, new_size, facade.material_index)
-                    sub_facade.cur_floor_ind = facade.cur_floor_ind
-                    sub_floors[i] = floor_f(sub_facade)[0]
-
-            floor = facade.get_floor()
-            try:
-                for sub_f in filter(bool, sub_floors):
-                    for panel in sub_f.panels_stack:
-                        floor.panels_stack.append(panel)
-            except IndexError:
-                pass
-            # todo resize
+            if floor.panels_stack.is_full:
+                floor.panels_stack.fit_scale()
             if floor.panels_stack:
-                floor.height = max((p.size.y for p in floor.panels_stack), default=0)
                 return [floor]
+            else:
+                return []
         return join_floors
 
 
 class JoinFacadesNode(BaseNode, Node):
-    bl_idname = 'bn_JoinFacadesNode'
+    bl_idname = "bn_JoinFacadesNode"
     bl_label = "Join Facades"
     category = Categories.FACADE
     repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['facade0', 'facade1', 'facade2', 'facade3'])
-
-    def node_init(self):
-        self.inputs.new(FacadeSocket.bl_idname, "")
-        self.outputs.new(FacadeSocket.bl_idname, "")
+    Inputs = namedtuple('Inputs', ['match_mode', 'direction',  'facade'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='JoinFacadesNode.match_mode_items'),
+        SocketTemplate(EnumSocket, 'Direction', False, items_ref='JoinFacadesNode.direction_items'),
+        SocketTemplate(FacadeSocket),
+    )
+    Outputs = namedtuple('Outputs', ['facade'])
+    output_template = Outputs(SocketTemplate(FacadeSocket))
+    match_mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    direction_items = [(i, i.capitalize(), '') for i in ['VERTICAL', 'HORIZONTAL']]
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
-    def execute(inputs: Inputs, params):
+    def execute(inputs: Inputs, props):
         def join_facades(facade: Facade):
-            # read properties of downstream nodes
-            facade_impacts = []
-            facade_infinity = []
-            for facade_f in inputs:
-                if facade_f is None:
-                    continue
-                mock_facade = Facade(None, Vector((0, 0)), None)
-                with mock_facade.reading_props():
-                    facade_f(mock_facade)
-                    facade_impacts.append(mock_facade.join_factor)
-                    facade_infinity.append(mock_facade.is_infinite)
+            floors_stack: ShapesStack[Floor] = ShapesStack(facade.request_size.y)
+            fac_funcs = list(filter(bool, reversed(inputs[inputs._fields.index('facade'): -1])))
+            mode = inputs.match_mode(facade)
+            iter_funcs = {'NONE': iter, 'REPEAT': lambda a: chain(a, repeat(a[-1], 1000)), 'CYCLE': cycle}
 
-            # return properties to upstream nodes
-            if facade.read_props:
-                facade.join_factor = mean(facade_impacts)
-                facade.is_infinite = any(facade_infinity)
-                return
+            if inputs.direction(facade) == 'VERTICAL':
+                for fac_func in iter_funcs[mode](fac_funcs):
+                    with facade.size_context(Vector((facade.request_size.x, facade.request_size.y - floors_stack.width))):
+                        sub_stack = fac_func(facade)
+                        if not sub_stack:
+                            break
+                        try:
+                            floors_stack.extend(list(sub_stack))
+                        except IndexError:
+                            break
+            else:
+                for fac_func in iter_funcs[mode](fac_funcs[::-1]):
+                    current_len = floors_stack and floors_stack[0].panels_stack.width or 0
+                    with facade.size_context(Vector((facade.request_size.x - current_len, facade.request_size.y))):
+                        sub_stack: ShapesStack[Floor] = fac_func(facade)
+                    if not sub_stack:
+                        break
+                    is_floor_full = False
+                    for i, sub_floor in enumerate(sub_stack):
+                        # generate base floor
+                        try:
+                            floor = floors_stack[i]
+                        except IndexError:
+                            floor = facade.get_floor()
+                            floor.height = sub_floor.height
+                            floor.z_scale = sub_floor.z_scale
+                            floors_stack.append(floor, throw_error=False)
+                        # add empty panels if facades has different number of floors
+                        if i > 0 and not is_floor_full:
+                            empty_dist = floors_stack[0].panels_stack.width - (floor.panels_stack.width + sub_floor.panels_stack.width)
+                            if not isclose(empty_dist, 0, abs_tol=0.001):
+                                shell = PanelShell()
+                                shell.size = Vector((empty_dist, floor.height))
+                                floor.panels_stack.append(shell)
+                        # fill base floor
+                        try:
+                            floor.panels_stack.extend(list(sub_floor.panels_stack))
+                        except IndexError:
+                            is_floor_full = True
+                            break
+                    # extend last facade with empty floors
+                    for i, floor in enumerate(floors_stack):
+                        if i > 0:
+                            empty_dist = floors_stack[0].panels_stack.width - floor.panels_stack.width
+                            if not isclose(empty_dist, 0, abs_tol=0.001):
+                                shell = PanelShell()
+                                shell.size = Vector((empty_dist, floor.height))
+                                floor.panels_stack.append(shell)
+                    # scale panels
+                    if is_floor_full:
+                        for f in floors_stack:
+                            f.panels_stack.fit_scale()
+                        break
 
-            # generate fixed size facades
-            sub_facades = [None for _ in range(len(facade_impacts))]
-            for i, (facade_f, f_inf) in enumerate(zip((i for i in inputs if i), facade_infinity)):
-                if f_inf:
-                    continue
-                sub_facade = Facade(facade.index, facade.size, facade.material_index)
-                if facade_f(sub_facade):
-                    sub_facades[i] = sub_facade
-
-            # generate infinite size facades
-            current_size = sum(f.floors_stack.width for f in sub_facades if f is not None)
-            if current_size < facade.size.y:
-                rest_size = facade.size.y - current_size
-                impact_total = sum(compress(facade_impacts, facade_infinity))
-                for i, (impact, is_inf, facade_f) in enumerate(
-                        zip(facade_impacts, facade_infinity, (f for f in inputs if f is not None))):
-                    if not is_inf:
-                        continue
-                    new_size = Vector((facade.size.x, rest_size * (impact / impact_total)))
-                    sub_facade = Facade(facade.index, new_size, facade.material_index)
-                    if facade_f(sub_facade):
-                        sub_facades[i] = sub_facade
-
-            for sub_f in filter(bool, sub_facades):
-                try:
-                    for floor in sub_f.floors_stack:
-                        facade.floors_stack.append(floor)
-                except IndexError:
-                    pass
-            return bool(facade.floors_stack)
+            if floors_stack.is_full:
+                floors_stack.fit_scale()
+            return floors_stack
         return join_facades
 
 
@@ -1456,12 +1444,12 @@ class FacadePatternNode(BaseNode, Node):
     bl_label = "Facade Pattern"
     category = Categories.FACADE
     settings_viewer = FacadePatternNodeOperator
-    Inputs = namedtuple('Inputs', ['size', 'last', 'fill', 'distribute', 'first'])
+    Inputs = namedtuple('Inputs', ['height', 'length', 'last', 'fill', 'first'])
     input_template = Inputs(
-        SocketTemplate(FloatSocket, 'Size', False, 'DIAMOND_DOT', 1),
+        SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT'),
+        SocketTemplate(FloatSocket, 'Length', False, 'DIAMOND_DOT'),
         SocketTemplate(FloorSocket, 'Last'),
         SocketTemplate(FloorSocket, 'Fill'),
-        SocketTemplate(FloorSocket, 'Distribute'),
         SocketTemplate(FloorSocket, 'First'),
     )
     Outputs = namedtuple('Outputs', ['facade'])
@@ -1470,65 +1458,49 @@ class FacadePatternNode(BaseNode, Node):
     @staticmethod
     def execute(inputs: Inputs, params):
         def facade_generator(facade: Facade):
-            facade.join_factor = inputs.size(facade)
-            facade.is_infinite = inputs.fill is not None
+            use_height = facade.request_size.y > (height := inputs.height(facade)) > 0
+            request_size = Vector((length if(length := inputs.length(facade)) > 0 else facade.request_size.x,
+                                   height if use_height else facade.request_size.y))
             if facade.read_props:
                 return
 
-            def get_floors(func, ind=None) -> list:
-                if ind is None:
-                    ind = len(facade.floors_stack)
+            def get_floors(func, counter) -> list:
                 _floors = []
                 if func:
-                    for i in range(10):
-                        facade.cur_floor_ind = ind + i
+                    for fail_ind, try_ind in enumerate(counter):
+                        if fail_ind > 10:
+                            break
+                        facade.cur_floor_ind = try_ind
                         _floors = func(facade)
                         if _floors:
                             break
                 return _floors
 
-            floors_stack = facade.floors_stack
+            with facade.size_context(request_size):
+                floors_stack = ShapesStack(request_size.y)
+                floors_stack.extend(get_floors(inputs.first, count()), throw_error=False)
+                last_floors = get_floors(inputs.last, count())
+                floors_stack.extend(last_floors, throw_error=False)
+                # fill floors
+                if not floors_stack.is_full:
+                    fill_count = count()
+                    for i in range(1000):
+                        floors = get_floors(inputs.fill, fill_count)
+                        if not floors:
+                            break
+                        if any(isclose(floor.height, 0, abs_tol=0.001) for floor in floors):
+                            raise SizeError(f"The height of some panel is too small")
+                        try:
+                            if last_floors:
+                                floors_stack.insert(-1, floors)
+                            else:
+                                floors_stack.extend(floors)
+                        except IndexError:
+                            break
 
-            # generate floors
-            is_full = False
-            if inputs.first:
-                floors = get_floors(inputs.first)
-                if floors:
-                    last_floors = get_floors(inputs.last, len(facade.floors_stack) + len(floors))
-                    floors_size = sum(f.stack_size for f in floors) + sum(lf.stack_size for lf in last_floors)
-                    if floors_stack.max_width > floors_stack.width + floors_size:
-                        floors_stack.extend(floors)
-                    else:
-                        is_full = True
-            if inputs.fill:
-                for i in range(1000):
-                    floors = get_floors(inputs.fill)
-                    if any(isclose(floor.height, 0, abs_tol=0.001) for floor in floors):
-                        raise RuntimeError(f"The height of some panel is too small")
-                    if not floors:
-                        break
-
-                    last_floors = get_floors(inputs.last, len(facade.floors_stack) + len(floors))
-                    floors_size = sum(f.stack_size for f in floors) + sum(lf.stack_size for lf in last_floors)
-                    if floors_stack.max_width > floors_stack.width + floors_size:
-                        floors_stack.extend(floors)
-                    else:
-                        is_full = True
-                        break
-            try:
-                floors_stack.extend(get_floors(inputs.last))
-            except IndexError:
-                pass
-
-            if floors_stack:
-                if is_full:
-                    floors_stack.fit_scale()
-                else:
-                    for floor in floors_stack:
-                        floor.is_scalable = False
-                return True
-            else:
-                return False
+            if floors_stack.is_full:
+                floors_stack.fit_scale()
+            return floors_stack
 
         return facade_generator
 
@@ -2306,6 +2278,14 @@ class DistSlice:
         self.stop = None if self.stop is None else self.stop + other
         return self
 
+    def __sub__(self, other: float) -> 'DistSlice':
+        return DistSlice(self.start, None if self.stop is None else self.stop - other)
+
+    def __isub__(self, other: float) -> 'DistSlice':
+        if self.stop is not None:
+            self.stop = self.stop - other
+        return self
+
     def __repr__(self):
         start = self.start.__format__('.2f') if self.start is not None else None
         stop = self.stop.__format__('.2f') if self.stop is not None else None
@@ -2432,21 +2412,17 @@ class PanelShell(Shape):
 
 
 class Floor(Shape):
-    def __init__(self, facade: 'Facade'):
+    def __init__(self, facade: 'Facade', width: float = None):
         self.index = facade.cur_floor_ind
         self.z_scale = 1
-        self.panels_stack: ShapesStack[Panel] = ShapesStack(facade.size.x)
+        self.panels_stack: ShapesStack[Panel] = ShapesStack(min(width or inf, facade.size.x))
 
         # user attributes
         self.height = None
         self.is_scalable = True
-        self.join_size = 1
-
-        # util attributes
-        self.is_infinite = None
 
     def copy(self, facade: 'Facade'):
-        floor = Floor(facade)
+        floor = Floor(facade, self.panels_stack.max_width)
         floor.height = self.height
         floor.z_scale = self.z_scale
         floor.panels_stack = self.panels_stack.copy()
@@ -2469,6 +2445,8 @@ class Floor(Shape):
         panels = self.panels_stack[panels_range]
         width = sum(p.stack_size for p in panels)
         scalable_width = sum(p.stack_size for p in panels if p.is_scalable)
+        if panels and panels[-1] == self.panels_stack[-1]:
+            panels_range = panels_range - (build.cur_facade.size.x - self.panels_stack.width)
         xy_factor = (panels_range.length - (width - scalable_width)) / scalable_width
         for panel in panels:
             p_xy_factor = xy_factor if panel.is_scalable else 1
@@ -2491,6 +2469,7 @@ class ShapesStack(Generic[ShapeType]):
         self._shapes: list[Shape] = []
         self._cum_width: list[float] = [0]
         self.max_width = max_width
+        self.is_full = False
 
     def copy(self):
         stack = ShapesStack(self.max_width)
@@ -2498,19 +2477,36 @@ class ShapesStack(Generic[ShapeType]):
         stack._cum_width = self._cum_width.copy()
         return stack
 
-    def append(self, shape: Shape):
+    def append(self, shape: Shape, throw_error=True):
         if self.can_be_added(shape.stack_size):
             self._cum_width.append(self._cum_width[-1] + (shape and shape.stack_size or 0))
             self._shapes.append(shape)
         else:
-            raise IndexError("Given shape is too big or shape stuck is full")
+            self.is_full = True
+            if throw_error:
+                raise IndexError("Given shape is too big or shape stuck is full")
 
-    def extend(self, shapes: list[Shape]):
+    def extend(self, shapes: list[Shape], throw_error=True):
         if self.can_be_added(sum(s.stack_size for s in shapes)):
             self._cum_width.extend(self._cum_width[-1] + s.stack_size for s in shapes)
             self._shapes.extend(shapes)
         else:
-            raise IndexError("Given shapes are too big or shape stuck is full")
+            self.is_full = True
+            if throw_error:
+                raise IndexError("Given shapes are too big or shape stuck is full")
+
+    def insert(self, index: int, shape: Union[Shape, list[Shape]]):
+        if isinstance(shape, list):
+            if self.can_be_added(sum(s.stack_size for s in shape)):
+                self[index: index] = shape
+                return
+        else:
+            if self.can_be_added(shape.stack_size):
+                self[index: index] = [shape]
+                return
+
+        self.is_full = True
+        raise IndexError("Given shape is too big or shape stuck is full")
 
     def replace(self, shapes: list[Shape], position: DistSlice) -> list[Shape]:
         replace_ind = self._range_to_indexes(position)
@@ -2544,6 +2540,8 @@ class ShapesStack(Generic[ShapeType]):
         +-------+------+------  in this case the panel should not be added
         │ *     │ *    │
         """
+        if not self._shapes:
+            return True
         cur_scale_dist = self.max_width - self.width
         if cur_scale_dist < 0:
             return False
@@ -2668,14 +2666,11 @@ class Facade:
         self.left_wall_angle = None
         self.right_wall_angle = None
 
-        # user props
-        self.join_factor = None
-
         # util props
-        self.is_infinite = None
+        self.request_size = size
 
-    def get_floor(self) -> Floor:
-        floor = Floor(self)
+    def get_floor(self, width=None) -> Floor:
+        floor = Floor(self, width)
         self.cur_floor = floor
         return floor
 
@@ -2687,6 +2682,14 @@ class Facade:
             yield None
         finally:
             self.read_props = current_state
+
+    @contextmanager
+    def size_context(self, size: Vector = None):
+        last_size = self.request_size.copy()
+        if size:
+            self.request_size = size
+        yield None
+        self.request_size = last_size
 
     def do_instance(self, build: 'Building', grid: 'CentredMeshGrid'):
         """     ↑ direction 3D
@@ -2723,6 +2726,8 @@ class Facade:
 
             height = sum(f.stack_size for f in floors)
             scalable_height = sum(f.stack_size for f in floors if f.is_scalable)
+            if floors[-1] == self.floors_stack[-1]:
+                current_range -= self.size.y - self.floors_stack.width
             z_factor = (current_range.length - (height - scalable_height)) / scalable_height
 
             current_range = DistSlice(current_range.stop, current_range.stop)
@@ -3063,6 +3068,10 @@ class Geometry:
                 next_faces.append(((left_next, right_next), pos + Vector((-1, 0))))
         gr.clean_grid()
         return gr
+
+
+class SizeError(Exception):
+    """When an element is to small to perform operation"""
 
 
 def transfer_data_menu(self, context):
