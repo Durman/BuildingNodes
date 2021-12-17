@@ -1731,6 +1731,18 @@ class ComparisonMathNode(BaseNode, Node):
         return compare_values
 
 
+class StyleOperationsMenu(Menu):
+    bl_idname = "OBJECT_MT_style_operations"
+    bl_label = "Style operations"
+
+    def draw(self, context):
+        lay = self.layout
+        lay.operator_enum(ApplyBuildingStyleOperator.bl_idname, "mode")
+        lay.separator()
+        lay.operator(LinkBuildingStyleOperator.bl_idname, text="Link style to selected")
+        lay.operator(SelectByStyleOperator.bl_idname, text="Select with the same style")
+
+
 class ObjectPanel(Panel):
     bl_idname = "VIEW3D_PT_ObjectPanel"
     bl_space_type = "VIEW_3D"
@@ -1747,12 +1759,15 @@ class ObjectPanel(Panel):
             col.label(text=obj.building_props.error, icon='ERROR')
         if obj:
             props: ObjectProperties = obj.building_props
-            row = col.row(align=True, heading="Facade style:")
-            row.active = props.building_style is not None
-            row.prop(props, 'show_in_edit_mode', text='', icon='EDITMODE_HLT')
-            row.prop(props, 'realtime', text='', icon='RESTRICT_VIEW_OFF' if props.realtime else 'RESTRICT_VIEW_ON')
-            row.prop(props, 'show_in_render', text='',
+            row = col.row(align=True)
+            row1 = row.row(align=True, heading="Facade style:")
+            row1.active = props.building_style is not None
+            row1.prop(props, 'show_in_edit_mode', text='', icon='EDITMODE_HLT')
+            row1.prop(props, 'realtime', text='', icon='RESTRICT_VIEW_OFF' if props.realtime else 'RESTRICT_VIEW_ON')
+            row1.prop(props, 'show_in_render', text='',
                      icon='RESTRICT_RENDER_OFF' if props.show_in_render else 'RESTRICT_RENDER_ON')
+            row2 = row.row(align=True)
+            row2.menu(StyleOperationsMenu.bl_idname, text='', icon='DOWNARROW_HLT')
             col.template_ID(props, 'building_style', new=AddNewBuildingStyleOperator.bl_idname,
                             unlink=UnlinkBuildingStyleOperator.bl_idname)
 
@@ -2229,9 +2244,14 @@ class EditPanelAttributesOperator(Operator):
 class LinkBuildingStyleOperator(Operator):
     bl_idname = "bn.link_building_style"
     bl_label = "Link Building Style"
+    bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
-    def pool(cls, context):
+    def description(cls, context, properties):
+        return f'Add style="{context.object.building_props.building_style.name}" to selected objects'
+
+    @classmethod
+    def poll(cls, context):
         return bool(context.object)
 
     def execute(self, context):
@@ -2242,6 +2262,90 @@ class LinkBuildingStyleOperator(Operator):
             if obj != active:
                 obj.building_props.building_style = style_tree
         return {'FINISHED'}
+
+
+class SelectByStyleOperator(Operator):
+    bl_idname = "bn.select_by_style"
+    bl_label = "Select by style"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def description(cls, context, properties):
+        return f'Select all objects with style="{context.object.building_props.building_style.name}"'
+
+    @classmethod
+    def poll(cls, context):
+        if context.object and context.object.building_props.building_style:
+            return True
+        else:
+            cls.poll_message_set("Active object doesn't have building style")
+            return False
+
+    def execute(self, context):
+        active = context.object
+        current_style = active.building_props.building_style
+        for obj in context.scene.objects:
+            if obj.building_props.building_style == current_style and obj.visible_get():
+                obj.select_set(True)
+        return {'FINISHED'}
+
+
+class ApplyBuildingStyleOperator(Operator):
+    bl_idname = "bn.apply_building_style"
+    bl_label = "Apply Building Style"
+    bl_options = {"REGISTER", "UNDO"}
+    modes = [
+        ("TO_ACTIVE", "Apply style (to active)", "Apply building style of active object"),
+        ("TO_SELECTED", "Apply style (to selected)", "Apply building style of all selected objects"),
+        ("CURRENT_TO_ALL", "Apply current style (to all)", "Apply style of visible objects with style equal to active object style"),
+    ]
+
+    mode: EnumProperty(items=modes)
+
+    @classmethod
+    def description(cls, context, properties):
+        for mode in cls.modes:
+            if mode[0] == properties.mode:
+                return mode[2]
+
+    @classmethod
+    def poll(cls, context):
+        if context.object and context.object.building_props.building_style:
+            return True
+        else:
+            cls.poll_message_set("Active object doesn't have building style")
+            return False
+
+    def execute(self, context):
+        if self.mode == 'TO_ACTIVE':
+            self.apply_to_selected(context, context.object)
+        elif self.mode == 'TO_SELECTED':
+            for obj in context.selected_objects:
+                if obj.type == 'MESH':
+                    self.apply_to_selected(context, obj)
+        elif self.mode == 'CURRENT_TO_ALL':
+            current_style = context.object.building_props.building_style
+            for obj in context.scene.objects:
+                if obj.building_props.building_style == current_style and obj.visible_get():
+                    self.apply_to_selected(context, obj)
+        else:
+            raise TypeError(f"Unknown({self.mode}) mode is given")
+        return {'FINISHED'}
+
+    @staticmethod
+    def apply_to_selected(context, obj):
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = None
+        bpy.ops.object.duplicates_make_real()  # it's not always work if the object is active
+        context.view_layer.objects.active = obj
+        for mod in obj.modifiers:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        obj.building_props.building_style = None
+
+        # join
+        obj.select_set(True)
+        bpy.ops.object.join()
 
 
 classes = dict()
