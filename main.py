@@ -51,11 +51,6 @@ def profile(fun=None, *, sort: Literal['time', 'cumulative'] = 'time', length=10
     return inner
 
 
-class FacadeTreeNames(PropertyGroup):
-    identifier: bpy.props.StringProperty()
-    user_name: bpy.props.StringProperty()
-
-
 class BuildingStyleTree(NodeTree):
     bl_idname = 'bn_BuildingStyleTree'
     bl_label = "Building Style Editor"
@@ -64,7 +59,6 @@ class BuildingStyleTree(NodeTree):
 
     inst_col: bpy.props.PointerProperty(type=bpy.types.Collection, description="Keep all panels to be instanced")  # todo should be set to None during copying
     was_changed: bpy.props.BoolProperty(description="If True the tree should be reevaluated")
-    facade_names: bpy.props.CollectionProperty(type=FacadeTreeNames)
 
     def update(self):
         BuildingStyleTree.was_changes = True
@@ -119,8 +113,7 @@ class BuildingStyleTree(NodeTree):
             bm = bmesh.new()
             bm.from_mesh(obj.data)
         bm.faces.ensure_lookup_table()
-        obj_fac_names = [names.obj_facade_name for names in obj_props.facade_names_mapping]
-        points_bm = self.get_points(bm, obj_fac_names)
+        points_bm = self.get_points(bm)
         points_bm.to_mesh(obj_props.points.data)
         points_bm.free()
         if obj.mode != 'EDIT':
@@ -132,7 +125,7 @@ class BuildingStyleTree(NodeTree):
         gn_tree.set_instances(self.inst_col)
 
     # @profile(sort='cumulative', file=Path.home() / 'desktop' / 'stats')
-    def get_points(self, base_bm, obj_facade_names):
+    def get_points(self, base_bm):
         self.store_instances()
         sock_data = dict()
         for node, prev_socks in self.walk():
@@ -267,16 +260,6 @@ class BuildingStyleTree(NodeTree):
             yield node
             visited.add(node)
             prev_nodes.extend(prev_node for s in list(node.inputs)[::-1] if (prev_node := nodes.get(s)) is not None)
-
-    def update_facade_names(self):
-        # todo make interface of all output nodes equal
-        for node in self.nodes:
-            if node.bl_idname == BuildingStyleNode.bl_idname:
-                self.facade_names.clear()
-                for socket in node.inputs[1:]:
-                    sock_names: FacadeTreeNames = self.facade_names.add()
-                    sock_names.identifier = socket.identifier
-                    sock_names.user_name = socket.user_name or socket.default_name
 
     def update_sockets(self):
         """ Supports (only for nodes with template attributes):
@@ -1753,11 +1736,9 @@ class ObjectPanel(Panel):
     def draw(self, context):
         col = self.layout.column()
         obj = context.object
-        if obj is None:
-            return
-        if obj.building_props.error:
-            col.label(text=obj.building_props.error, icon='ERROR')
         if obj:
+            if obj.building_props.error:
+                col.label(text=obj.building_props.error, icon='ERROR')
             props: ObjectProperties = obj.building_props
             row = col.row(align=True)
             row1 = row.row(align=True, heading="Facade style:")
@@ -1770,28 +1751,6 @@ class ObjectPanel(Panel):
             row2.menu(StyleOperationsMenu.bl_idname, text='', icon='DOWNARROW_HLT')
             col.template_ID(props, 'building_style', new=AddNewBuildingStyleOperator.bl_idname,
                             unlink=UnlinkBuildingStyleOperator.bl_idname)
-
-            col.prop(props, 'show_facade_names',
-                     icon='DOWNARROW_HLT' if props.show_facade_names else 'RIGHTARROW', emboss=False)
-            if props.show_facade_names and props.building_style:
-                col.use_property_split = True
-                col.use_property_decorate = False
-                for f_map in props.facade_names_mapping:
-                    row = col.row(align=True)
-                    row.prop(f_map, 'obj_facade_name', text=f_map.tree_facade_name)
-                    if obj.mode == 'EDIT':
-                        add_op = row.operator(EditBuildingAttributesOperator.bl_idname, text='', icon='ADD')
-                        add_op.operation = 'add'
-                        add_op.attr_name = f_map.obj_facade_name
-                        remove_op = row.operator(EditBuildingAttributesOperator.bl_idname, text='', icon='REMOVE')
-                        remove_op.operation = 'remove'
-                        remove_op.attr_name = f_map.obj_facade_name
-                if obj.mode == 'EDIT':
-                    row = col.row(align=True)
-                    add_op = row.operator(EditBuildingAttributesOperator.bl_idname,
-                                          text='Add to fill facade', icon='ADD')
-                    add_op.operation = 'add'
-                    add_op.attr_name = ''
         else:
             col.label(text='Select object')
 
@@ -1806,7 +1765,6 @@ class PanelPanel(Panel):
     def draw(self, context):
         col = self.layout.column()
         col.operator(EditPanelAttributesOperator.bl_idname, text="Set scope").operation = 'set_scope'
-        # col.operator(EditPanelAttributesOperator.bl_idname, text="Origin to scope center").operation = 'set_origin'
 
 
 class GeometryTreeInterface:
@@ -1900,20 +1858,6 @@ class GeometryTreeInterface:
         obj.modifiers['BuildingStyle']["Input_5_attribute_name"] = "Wall index"
 
 
-class FacadeNamesMapping(PropertyGroup):
-    def update_obj_facade_name(self, context):
-        # rename event
-        prev_name_key = 'prev_name'
-        if prev_name_key in self and self[prev_name_key] != '':
-            bpy.ops.bn.edit_facade_attributes(
-                operation='rename', attr_name=self[prev_name_key], new_attr_name=self.obj_facade_name)
-        self[prev_name_key] = self.obj_facade_name
-
-    tree_facade_identifier: bpy.props.StringProperty(description="Socket identifier")
-    tree_facade_name: bpy.props.StringProperty()
-    obj_facade_name: bpy.props.StringProperty(update=update_obj_facade_name)
-
-
 class ObjectProperties(PropertyGroup):
     def is_building_tree(self, tree):
         return tree.bl_idname == BuildingStyleTree.bl_idname
@@ -1926,7 +1870,6 @@ class ObjectProperties(PropertyGroup):
             self.error = ''
         else:
             self.building_style.show_in_areas(True)
-            self.update_mapping()
             try:
                 self.building_style.apply(self.id_data)
             except Exception as e:
@@ -1962,8 +1905,6 @@ class ObjectProperties(PropertyGroup):
         default=True, description='Display building style in viewport', update=update_realtime)
     show_in_render: bpy.props.BoolProperty(
         default=True, description='Use building style during render', update=update_show_in_render)
-    show_facade_names: bpy.props.BoolProperty(name='Named facades', default=True)
-    facade_names_mapping: bpy.props.CollectionProperty(type=FacadeNamesMapping)
 
     def apply_style(self):
         if self.id_data.mode == 'EDIT':
@@ -1994,26 +1935,6 @@ class ObjectProperties(PropertyGroup):
             modifier = obj.modifiers.new("BuildingStyle", 'NODES')
 
         return GeometryTreeInterface(obj, modifier.node_group)
-
-    def update_mapping(self):
-        mapping = {m.tree_facade_identifier: m.obj_facade_name for m in self.facade_names_mapping}
-        if self.building_style:
-            self.facade_names_mapping.clear()
-            facade: FacadeTreeNames
-            for facade in self.building_style.facade_names:
-                f_map: FacadeNamesMapping = self.facade_names_mapping.add()
-
-                # new facade name
-                if facade.identifier not in mapping:
-                    f_map.tree_facade_identifier = facade.identifier
-                    f_map.tree_facade_name = facade.user_name
-                else:
-                    f_map.tree_facade_identifier = facade.identifier
-                    f_map.tree_facade_name = facade.user_name
-                    f_map.obj_facade_name = mapping[facade.identifier]
-
-    def facade_names_mapping(self) -> Iterable[tuple[str, Optional[bpy.types.FaceMap]]]:
-        yield from zip((n.name for n in self.building_style.facade_names), chain(self.id_data.face_maps, cycle([None])))
 
 
 class AddNewBuildingStyleOperator(Operator):
@@ -2117,11 +2038,6 @@ class EditSocketsOperator(Operator):
             sock_col.move(current_index, current_index + 1)
         else:
             raise TypeError(f"It is not known how to handle the operation={self.operation}")
-        tree.update_facade_names()
-        for obj in bpy.data.objects:
-            props: ObjectProperties = obj.building_props
-            if props.building_style and props.building_style.bl_idname == BuildingStyleTree.bl_idname:
-                props.update_mapping()
         return {'FINISHED'}
 
     def invoke(self, context, event):
