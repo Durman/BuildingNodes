@@ -548,8 +548,6 @@ class SocketTemplate(NamedTuple):
 class NodeSettingsOperator:
     bl_label = "Node settings"
     bl_options = {'INTERNAL', }
-    panel_props = []
-    floor_props = []
 
     # internal usage
     tree_name: StringProperty()
@@ -573,14 +571,14 @@ class NodeSettingsOperator:
         node = context.node
         self.node = node
 
-        if self.panel_props:
+        if node.panel_props:
             panel_names = []
             for search_node in node.id_data.walk_back(node):
                 if search_node.bl_idname == PanelNode.bl_idname:
                     panel_names.append(search_node.name)
             node['panel_names'] = panel_names
 
-        if self.floor_props:
+        if node.floor_props:
             panel_names = []
             for search_node in node.id_data.walk_back(node):
                 if search_node.bl_idname == FloorPatternNode.bl_idname:
@@ -597,12 +595,12 @@ class NodeSettingsOperator:
     def draw_all(layout, node):  # should be used in Property panel
         box = layout.box()
         NodeSettingsOperator.draw_sockets(box, node)
-        if node.settings_viewer.panel_props:
+        if node.panel_props:
             box = layout.box()
-            NodeSettingsOperator.draw_remote_props(box, node, 'PANEL', node.settings_viewer.panel_props)
-        if node.settings_viewer.floor_props:
+            NodeSettingsOperator.draw_remote_props(box, node, 'PANEL', node.panel_props)
+        if node.floor_props:
             box = layout.box()
-            NodeSettingsOperator.draw_remote_props(box, node, 'FLOOR', node.settings_viewer.floor_props)
+            NodeSettingsOperator.draw_remote_props(box, node, 'FLOOR', node.floor_props)
 
     @staticmethod
     def draw_sockets(layout, node):
@@ -651,6 +649,8 @@ class BaseNode:
     props_template: tuple = []
     settings_viewer = None
     main_prop = None  # name of the input socket to show its value in first output socket
+    panel_props: list[str] = []  # list of panel remote properties to show
+    floor_props: list[str] = []  # list of floor remote properties to show
 
     @classmethod
     def poll(cls, tree):
@@ -765,15 +765,11 @@ class ObjectInputNode(BaseNode, Node):
         layout.prop(self, 'model')
 
 
-class PanelNodeSettingsOperator(NodeSettingsOperator, Operator):
-    bl_idname = 'bn.panel_node_settings'
-
-
 class PanelNode(BaseNode, Node):
     bl_idname = 'bn_PanelNode'
     bl_label = "Panel"
     category = Categories.PANEL
-    settings_viewer = PanelNodeSettingsOperator
+    settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding', 'probability'])
     Props = namedtuple('Props', ['panel_index'])
     input_template = Inputs(
@@ -888,18 +884,14 @@ class SetPanelAttributeNode(BaseNode, Node):
         return set_panel_attr
 
 
-class PanelRandomizePropsOperator(NodeSettingsOperator, Operator):
-    bl_idname = "bn.panel_randomize_props"
-    panel_props = ['probability']
-
-
 class PanelRandomizeNode(BaseNode, Node):
     bl_idname = 'bn_PanelRandomizeNode'
     bl_label = "Panel Randomize"
     category = Categories.PANEL
     repeat_last_socket = True
-    settings_viewer = PanelRandomizePropsOperator
+    settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['seed', 'panel0', 'panel1', 'panel2', 'panel3'])
+    panel_props = ['probability']
 
     def node_init(self):
         self.inputs.new(IntSocket.bl_idname, "Seed").display_shape = 'DIAMOND_DOT'
@@ -994,15 +986,11 @@ class PanelItemsNode(BaseNode, Node):
         return get_facade_item
 
 
-class MirrorPanelNodeSettings(NodeSettingsOperator, Operator):
-    bl_idname = 'bn.mirror_panel_node_settings'
-
-
 class MirrorPanelNode(BaseNode, Node):
     bl_idname = 'bn_MirrorPanelNode'
     bl_label = 'Mirror Panel'
     category = Categories.PANEL
-    settings_viewer = MirrorPanelNodeSettings
+    settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['panel', 'mirror_x', 'mirror_y'])
     input_template = Inputs(
         SocketTemplate(PanelSocket),
@@ -1077,16 +1065,11 @@ class JoinPanelsNode(BaseNode, Node):
         return join_panels
 
 
-class FloorPatternNodeSettings(NodeSettingsOperator, Operator):
-    bl_idname = 'bn.floor_pattern_node_settings'
-    panel_props = ['scalable']
-
-
 class FloorPatternNode(BaseNode, Node):
     bl_idname = 'bn_FloorPatternNode'
     bl_label = "Floor Pattern"
     category = Categories.FLOOR
-    settings_viewer = FloorPatternNodeSettings
+    settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['height', 'length', 'scalable', 'left', 'fill', 'right'])
     input_template = Inputs(
         SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT'),
@@ -1098,6 +1081,7 @@ class FloorPatternNode(BaseNode, Node):
     )
     Outputs = namedtuple('Outputs', ['floor'])
     output_template = Outputs(SocketTemplate(FloorSocket))
+    panel_props = ['scalable']
 
     @staticmethod
     def execute(inputs: Inputs, props):
@@ -1417,16 +1401,11 @@ class JoinFacadesNode(BaseNode, Node):
         return join_facades
 
 
-class FacadePatternNodeOperator(NodeSettingsOperator, Operator):
-    bl_idname = 'bn.facade_pattern_node_settings'
-    floor_props = ['scalable']
-
-
 class FacadePatternNode(BaseNode, Node):
     bl_idname = 'bn_FacadePatternNode'
     bl_label = "Facade Pattern"
     category = Categories.FACADE
-    settings_viewer = FacadePatternNodeOperator
+    settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['height', 'length', 'last', 'fill', 'first'])
     input_template = Inputs(
         SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT'),
@@ -1437,6 +1416,7 @@ class FacadePatternNode(BaseNode, Node):
     )
     Outputs = namedtuple('Outputs', ['facade'])
     output_template = Outputs(SocketTemplate(FacadeSocket))
+    floor_props = ['scalable']
 
     @staticmethod
     def execute(inputs: Inputs, params):
