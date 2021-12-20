@@ -266,7 +266,7 @@ class BuildingStyleTree(NodeTree):
         - adding sockets from a template which identifier was not found in a sockets collection
         - marking sockets as deprecated which identifiers are not found in a template
         """
-        for node in (n for n in self.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame'}):
+        for node in (n for n in self.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame', 'NodeUndefined'}):
             if node.input_template:
                 socks = {s.identifier: s for s in node.inputs}
                 if node.repeat_last_socket:
@@ -588,7 +588,7 @@ class NodeSettingsOperator:
         if node.floor_props:
             panel_names = []
             for search_node in node.id_data.walk_back(node):
-                if search_node.bl_idname == FloorPatternNode.bl_idname:
+                if search_node.bl_idname == FloorNode.bl_idname:
                     panel_names.append(search_node.name)
             node['floor_names'] = panel_names
 
@@ -759,30 +759,16 @@ class BuildingStyleNode(BaseNode, Node):
         return build.bm
 
 
-class ObjectInputNode(BaseNode, Node):
-    bl_idname = 'bn_ObjectInputNode'
-    bl_label = "Object Input"
-
-    model: bpy.props.PointerProperty(type=bpy.types.Object)
-
-    def node_init(self):
-        self.outputs.new(ObjectSocket.bl_idname, "")
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, 'model')
-
-
 class PanelNode(BaseNode, Node):
     bl_idname = 'bn_PanelNode'
     bl_label = "Panel"
     category = Categories.PANEL
     settings_viewer = DefaultNodeSettings
-    Inputs = namedtuple('Inputs', ['object', 'scalable', 'scope_padding', 'probability'])
+    Inputs = namedtuple('Inputs', ['object', 'scalable', 'probability'])
     Props = namedtuple('Props', ['panel_index'])
     input_template = Inputs(
         SocketTemplate(ObjectSocket, enabled=False),
         SocketTemplate(BoolSocket, 'Scalable', enabled=False, default_value=True),
-        SocketTemplate(Vector4Socket, 'Scope padding', enabled=False),
         SocketTemplate(FloatSocket, 'Probability', enabled=False, default_value=1),
     )
     Outputs = namedtuple('Outputs', ['panel'])
@@ -820,7 +806,6 @@ class PanelNode(BaseNode, Node):
             panel = Panel(props.panel_index, size_v_catch)
             panel.probability = inputs.probability(facade)
             panel.is_scalable = inputs.scalable(facade)
-            panel.set_scope_padding(inputs.scope_padding(facade))  # for now it works only as scale
             return panel
         return panel_gen
 
@@ -829,9 +814,8 @@ class PanelAttributesNode(BaseNode, Node):
     bl_idname = 'bn_PanelAttributesNode'
     bl_label = "Panel Attributes"
     category = Categories.PANEL
-
-    def node_init(self):
-        self.outputs.new(IntSocket.bl_idname, "Index").display_shape = 'DIAMOND'
+    Outputs = namedtuple('Outputs', ['index'])
+    output_template = Outputs(SocketTemplate(IntSocket, 'Index'))
 
     @staticmethod
     def execute(inputs, props):
@@ -897,13 +881,11 @@ class PanelRandomizeNode(BaseNode, Node):
     category = Categories.PANEL
     repeat_last_socket = True
     settings_viewer = DefaultNodeSettings
-    Inputs = namedtuple('Inputs', ['seed', 'panel0', 'panel1', 'panel2', 'panel3'])
+    Inputs = namedtuple('Inputs', ['seed', 'panel'])
+    input_template = Inputs(SocketTemplate(IntSocket, 'Index'), SocketTemplate(PanelSocket))
+    Outputs = namedtuple('Outputs', ['panel'])
+    output_template = Outputs(SocketTemplate(PanelSocket))
     panel_props = ['probability']
-
-    def node_init(self):
-        self.inputs.new(IntSocket.bl_idname, "Seed").display_shape = 'DIAMOND_DOT'
-        self.inputs.new(PanelSocket.bl_idname, "")
-        self.outputs.new(PanelSocket.bl_idname, "")
 
     @staticmethod
     def execute(inputs: Inputs, params):
@@ -956,35 +938,32 @@ class StackPanelsNode(BaseNode, Node):
         self.outputs.new(PanelSocket.bl_idname, "")
 
 
-class PanelItemsNode(BaseNode, Node):
-    bl_idname = 'bn_PanelItemsNode'
-    bl_label = "Panel Items"
+class SelectPanelNode(BaseNode, Node):
+    bl_idname = 'bn_SelectPanelNode'
+    bl_label = "Select Panel"
     category = Categories.PANEL
     repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['index', 'panel0', 'panel1', 'panel2'])
-    Props = namedtuple('Props', ['match_mode'])
-
-    match_mode: EnumProperty(items=[(i.upper(), i, '') for i in ['None', 'Repeat', 'Cycle']],
-                             update=lambda s, c: s.id_data.update())
-
-    def node_init(self):
-        self.inputs.new(IntSocket.bl_idname, "Index").display_shape = 'DIAMOND_DOT'
-        self.inputs.new(PanelSocket.bl_idname, "")
-        self.outputs.new(PanelSocket.bl_idname, "")
-
-    def draw_buttons(self, context, layout):
-        row = layout.row()
-        row.prop(self, 'match_mode', expand=True)
+    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'panel'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectPanelNode.mode_items'),
+        SocketTemplate(IntSocket, 'Index'),
+        SocketTemplate(PanelSocket),
+    )
+    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    Outputs = namedtuple('Outputs', ['panel'])
+    output_template = Outputs(SocketTemplate(PanelSocket))
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
-    def execute(inputs: Inputs, props: Props):
+    def execute(inputs: Inputs, props):
         def get_facade_item(facade: Facade):
-            panel_funcs = {i: f for i, f in enumerate(inputs[1:]) if f is not None}
-            if props.match_mode == 'NONE':
+            panel_funcs = {i: f for i, f in enumerate(inputs[inputs._fields.index('panel'): -1])}
+            mode = inputs.match_mode(facade)
+            if mode == 'NONE':
                 index = inputs.index(facade)
-            elif props.match_mode == 'REPEAT':
+            elif mode == 'REPEAT':
                 index = min(len(panel_funcs) - 1, inputs.index(facade))
-            elif props.match_mode == 'CYCLE':
+            elif mode == 'CYCLE':
                 index = inputs.index(facade) % len(panel_funcs)
             panel_f = panel_funcs.get(int(index))
             if panel_f:
@@ -1072,9 +1051,9 @@ class JoinPanelsNode(BaseNode, Node):
         return join_panels
 
 
-class FloorPatternNode(BaseNode, Node):
-    bl_idname = 'bn_FloorPatternNode'
-    bl_label = "Floor Pattern"
+class FloorNode(BaseNode, Node):
+    bl_idname = 'bn_FloorNode'
+    bl_label = "Floor"
     category = Categories.FLOOR
     settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['height', 'length', 'scalable', 'left', 'fill', 'right'])
@@ -1408,9 +1387,9 @@ class JoinFacadesNode(BaseNode, Node):
         return join_facades
 
 
-class FacadePatternNode(BaseNode, Node):
-    bl_idname = 'bn_FacadePatternNode'
-    bl_label = "Facade Pattern"
+class FacadeNode(BaseNode, Node):
+    bl_idname = 'bn_FacadeNode'
+    bl_label = "Facade"
     category = Categories.FACADE
     settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['height', 'length', 'last', 'fill', 'first'])
@@ -1537,23 +1516,36 @@ class SetFacadeAttributeNode(BaseNode, Node):
         layout.prop(self, "attribute", text='')
 
 
-class FacadeItemsNode(BaseNode, Node):
-    bl_idname = 'bn_FacadeItemsNode'
-    bl_label = "Facade Items"
+class SelectFacadeNode(BaseNode, Node):
+    bl_idname = 'bn_SelectFacadeNode'
+    bl_label = "Select Facade"
     category = Categories.FACADE
     repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['index', 'facade0', 'facade1', 'facade2'])
-
-    def node_init(self):
-        self.inputs.new(IntSocket.bl_idname, "Index").display_shape = 'DIAMOND_DOT'
-        self.inputs.new(FacadeSocket.bl_idname, "")
-        self.outputs.new(FacadeSocket.bl_idname, "")
+    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'facade'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectFacadeNode.mode_items'),
+        SocketTemplate(IntSocket, 'Index'),
+        SocketTemplate(FacadeSocket),
+    )
+    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    Outputs = namedtuple('Outputs', ['facade'])
+    output_template = Outputs(SocketTemplate(FacadeSocket))
+    settings_viewer = DefaultNodeSettings
 
     @staticmethod
     def execute(inputs: Inputs, props):
         def get_facade_item(facade: Facade):
-            facade_funcs = {i: f for i, f in enumerate(inputs[1:])}
-            facade_f = facade_funcs.get(inputs.index(facade))
+            facade_funcs = {i: f for i, f in enumerate(inputs[inputs._fields.index('facade'):-1])}
+            mode = inputs.match_mode(facade)
+            if mode == 'NONE':
+                index = inputs.index(facade)
+            elif mode == 'REPEAT':
+                index = min(len(facade_funcs) - 1, inputs.index(facade))
+            elif mode == 'CYCLE':
+                index = inputs.index(facade) % len(facade_funcs)
+            else:
+                raise TypeError(f"Unknown mode {mode}")
+            facade_f = facade_funcs.get(index)
             if facade_f:
                 return facade_f(facade)
 
@@ -1860,7 +1852,7 @@ class ObjectProperties(PropertyGroup):
             try:
                 self.building_style.apply(self.id_data)
             except Exception as e:
-                self.error = str(e)
+                self.error = repr(e)
                 raise
             else:
                 self.error = ''
@@ -1902,7 +1894,7 @@ class ObjectProperties(PropertyGroup):
             try:
                 self.building_style.apply(self.id_data)
             except Exception as e:
-                self.error = str(e)
+                self.error = repr(e)
                 traceback.print_exc()
             else:
                 self.error = ''
@@ -1939,8 +1931,8 @@ class AddNewBuildingStyleOperator(Operator):
         obj_props: ObjectProperties = obj.building_props
         tree = bpy.data.node_groups.new("BuildingStyle", BuildingStyleTree.bl_idname)
         node1 = tree.nodes.new(PanelNode.bl_idname)
-        node2: Node = tree.nodes.new(FloorPatternNode.bl_idname)
-        node3: Node = tree.nodes.new(FacadePatternNode.bl_idname)
+        node2: Node = tree.nodes.new(FloorNode.bl_idname)
+        node3: Node = tree.nodes.new(FacadeNode.bl_idname)
         node4: Node = tree.nodes.new(BuildingStyleNode.bl_idname)
         tree.links.new(node2.get_socket('fill', is_input=True), node1.outputs[0])
         tree.links.new(node3.get_socket('fill', is_input=True), node2.outputs[0])
@@ -3095,7 +3087,7 @@ def update_tree_timer():
                     obj_props.building_style.apply(obj)
                 except Exception as e:
                     traceback.print_exc()
-                    obj_props.error = str(e)
+                    obj_props.error = repr(e)
                 else:
                     obj_props.error = ''
                 finally:
@@ -3205,7 +3197,7 @@ def unregister():
 
 def _update_colors():
     for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
-        for node in (n for n in tree.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame'}):
+        for node in (n for n in tree.nodes if n.bl_idname not in {'NodeReroute', 'NodeFrame', 'NodeUndefined'}):
             if node.category is not None:
                 node.use_custom_color = True
                 node.color = node.category.color
