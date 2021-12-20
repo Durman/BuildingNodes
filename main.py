@@ -305,6 +305,7 @@ class BuildingStyleTree(NodeTree):
 
 class BaseSocket:
     show_text = True
+    default_shape = 'CIRCLE'
 
     def update_is_to_show(self, context):
         self.enabled = self.is_to_show
@@ -407,6 +408,7 @@ class FloatSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_FloatSocket'
     bl_label = "Float Socket"
     color = 0.5, 0.5, 0.5, 1.0
+    default_shape = 'DIAMOND_DOT'
     default_name = 'Float'
     value: bpy.props.FloatProperty(update=BaseSocket.update_value)
 
@@ -436,6 +438,7 @@ class IntSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_IntSocket'
     bl_label = "Int Socket"
     color = 0.0, 0.6, 0.0, 1.0
+    default_shape = 'DIAMOND_DOT'
     default_name = 'Integer'
     value: bpy.props.IntProperty(update=BaseSocket.update_value)
 
@@ -444,6 +447,7 @@ class StringSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_StringSocket'
     bl_label = "String Socket"
     color = 0.4, 0.6, 0.8, 1.0
+    default_shape = 'DIAMOND_DOT'
     default_name = 'String'
     value: bpy.props.StringProperty(update=BaseSocket.update_value)
 
@@ -451,6 +455,7 @@ class StringSocket(BaseSocket, NodeSocket):
 class BoolSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_BoolSocket'
     bl_label = "Bool Socket"
+    default_shape = 'DIAMOND_DOT'
     default_name = 'Bool'
     color = 0.75, 0.55, 0.75, 1.0
     value: bpy.props.BoolProperty(update=BaseSocket.update_value)
@@ -459,6 +464,7 @@ class BoolSocket(BaseSocket, NodeSocket):
 class VectorSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_VectorSocket'
     bl_label = "Vector Socket"
+    default_shape = 'DIAMOND_DOT'
     default_name = 'Vector'
     color = 0.4, 0.3, 0.7, 1.0
     value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value)
@@ -467,6 +473,7 @@ class VectorSocket(BaseSocket, NodeSocket):
 class Vector4Socket(BaseSocket, NodeSocket):
     bl_idname = 'bn_Vector4Socket'
     bl_label = "Vector 4 Socket"
+    default_shape = 'DIAMOND_DOT'
     default_name = 'Vector4'
     color = 0.4, 0.3, 0.7, 1.0
     value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value, size=4)
@@ -475,6 +482,7 @@ class Vector4Socket(BaseSocket, NodeSocket):
 class EnumSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_EnumSocket'
     bl_lable = "Enum Socket"
+    default_shape = 'DIAMOND_DOT'
     default_name = "Enum"
     color = 0, 0.3, 0, 1
 
@@ -533,10 +541,9 @@ class SocketTemplate(NamedTuple):
     def init(self, node: Node, is_input, identifier=None):
         node_sockets = node.inputs if is_input else node.outputs
         sock = node_sockets.new(self.type.bl_idname, self.name, identifier=identifier or '')
+        sock.display_shape = self.display_shape or sock.default_shape
         if not self.enabled:
             sock.is_to_show = False
-        if self.display_shape:
-            sock.display_shape = self.display_shape
         if self.default_value is not None:
             sock.value = self.default_value
         if self.type == EnumSocket:
