@@ -165,7 +165,7 @@ class BuildingStyleTree(NodeTree):
                 input_data = (Inp := node.gen_input_mapping()) and Inp(*in_data.values())
 
             if node.bl_idname == 'NodeReroute':
-                res = in_data[node.inputs[0].identifier]
+                res = in_data[node.inputs[0].identifier.replace('.', '')]
             else:
                 res = node.execute(input_data, props)
 
@@ -282,7 +282,7 @@ class BuildingStyleTree(NodeTree):
                 for key, sock in socks.items():
                     is_deprecated = not hasattr(node.input_template, key)
                     if is_deprecated and node.repeat_last_socket:
-                        if sock.bl_idname in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname}:
+                        if sock.bl_idname in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname, FloatSocket.bl_idname}:
                             if sock.bl_idname == node.inputs[-1].bl_idname:
                                 is_deprecated = False
                     sock.is_deprecated = is_deprecated
@@ -689,10 +689,10 @@ class BaseNode:
         links = {l.to_socket: l for l in self.id_data.links}
         if self.repeat_last_socket:
             sock_id_name = self.inputs[-1].bl_idname
-            if sock_id_name in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname}:
+            if sock_id_name in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname, FloatSocket.bl_idname}:
                 if self.inputs[-1].is_linked:
                     identifier = self.input_template._fields[-1] if self.input_template else ''
-                    self.inputs.new(sock_id_name, "", identifier=identifier)
+                    self.input_template[-1].init(self, True, identifier)
                 for low_sock, up_sock in zip(list(self.inputs)[::-1], list(self.inputs)[-2::-1]):
                     if up_sock in links or up_sock.bl_idname != sock_id_name:
                         break
@@ -1654,6 +1654,40 @@ class FloatValueNode(BaseNode, Node):
         return get_float
 
 
+class SelectValueNode(BaseNode, Node):
+    bl_idname = "bn_SelectValueNode"
+    bl_label = "Select value"
+    repeat_last_socket = True
+    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'value'])
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectValueNode.mode_items'),
+        SocketTemplate(IntSocket, 'Index'),
+        SocketTemplate(FloatSocket),
+    )
+    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    Outputs = namedtuple('Outputs', ['value'])
+    output_template = Outputs(SocketTemplate(FloatSocket))
+    settings_viewer = DefaultNodeSettings
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def select_value(facade: Facade):
+            func_ind = inputs._fields.index('value')
+            value_funcs = {i: f for i, f in enumerate(inputs[func_ind:])}
+            mode = inputs.match_mode(facade)
+            if mode == 'NONE':
+                index = inputs.index(facade)
+            elif mode == 'REPEAT':
+                index = min(len(value_funcs) - 1, inputs.index(facade))
+            elif mode == 'CYCLE':
+                index = inputs.index(facade) % len(value_funcs)
+            else:
+                raise TypeError(f"Unknown mode {mode}")
+            value_f = value_funcs.get(int(index))
+            return value_f(facade)
+        return select_value
+
+
 class ComparisonMathNode(BaseNode, Node):
     bl_idname = "bn_ComparisonMathNode"
     bl_label = "Comparison Math"
@@ -1720,7 +1754,7 @@ class ObjectPanel(Panel):
                 col.label(text=obj.building_props.error, icon='ERROR')
             props: ObjectProperties = obj.building_props
             row = col.row(align=True)
-            row1 = row.row(align=True, heading="Facade style:")
+            row1 = row.row(align=True, heading="Building style:")
             row1.active = props.building_style is not None
             row1.prop(props, 'show_in_edit_mode', text='', icon='EDITMODE_HLT')
             row1.prop(props, 'realtime', text='', icon='RESTRICT_VIEW_OFF' if props.realtime else 'RESTRICT_VIEW_ON')
@@ -2539,7 +2573,11 @@ class ShapesStack(Generic[ShapeType]):
         +-------+------+------  in this case the panel should not be added
         │ *     │ *    │
         """
+        # stack always should has at list one item
         if not self._shapes:
+            return True
+        # shape with 0 size always can be added
+        if size == 0:
             return True
         cur_scale_dist = self.max_width - self.width
         if cur_scale_dist < 0:
