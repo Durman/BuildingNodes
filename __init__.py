@@ -1,3 +1,8 @@
+# Building Nodes add-on for Blender for procedural building modeling
+# Copyright (C) 2021 Soluyanov Sergey | sv@soluyanov.ru
+# License - GPLv3
+
+
 import bisect
 import inspect
 import random
@@ -24,14 +29,27 @@ import numpy as np
 from bmesh.types import BMEdge, BMFace, BMLoop, BMVert, BMesh
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, BoolProperty, EnumProperty
-from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu
+from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu, AddonPreferences
 import nodeitems_utils
 from mathutils import Vector
 from nodeitems_utils import NodeCategory, NodeItem
 
 
+bl_info = {
+    "name": "Building Nodes",
+    "author": "Soluyanov Sergey",
+    "version": (1, 0, 0),
+    "blender": (3, 0, 0),
+    "location": "Property panel -> Building nodes panel and Building style tree editor",
+    "description": "Tool for procedural building modeling",
+    "warning": "",
+    "doc_url": "https://durman.github.io/BuildingNodesDocs/",
+    "tracker_url": "https://github.com/Durman/BuildingNodesDocs/discussions",
+    "category": "Object",
+}
+
+
 FACE_STYLE_LAYER_NAME = "BnStyleName"  # should be unchanged between versions
-VERSION = (0, 1)
 
 
 def profile(fun=None, *, sort: Literal['time', 'cumulative'] = 'time', length=10, file: Path = None):
@@ -665,7 +683,7 @@ class BaseNode:
 
     def init(self, context):
         # update node colors
-        self['version'] = VERSION
+        self['version'] = bl_info['version']
         if self.category is not None:
             self.use_custom_color = True
             self.color = self.category.color
@@ -2282,7 +2300,7 @@ for name, member in inspect.getmembers(sys.modules[__name__]):
     is_module_cls = inspect.isclass(member) and member.__module__ == __name__
     if is_module_cls:
         if any(base_cls in member.__bases__ for base_cls
-               in [NodeTree, NodeSocket, Node, Panel, Operator, PropertyGroup, Menu]):
+               in [NodeTree, NodeSocket, Node, Panel, Operator, PropertyGroup, Menu, AddonPreferences]):
             # property groups should be added before dependent classes
             # (doesn't take into account dependent Property groups)
             for annotation in get_type_hints(member).values():
@@ -3190,11 +3208,13 @@ def register():
     bpy.app.timers.register(update_tree_timer, persistent=True)
     bpy.app.handlers.load_post.append(transfer_data_menu)  # this is hack to store function somewhere
     bpy.types.VIEW3D_MT_make_links.append(transfer_data_menu)
-    for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
-        try:
-            tree.update_sockets()  # todo should be used on file loading
-        except Exception:
-            traceback.print_exc()
+    if __name__ == "__main__":
+        for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
+            try:
+                tree.update_sockets()  # todo should be used on file loading
+            except Exception:
+                traceback.print_exc()
+    print("Building Nodes: initialized")
 
 
 def unregister():

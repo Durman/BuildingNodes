@@ -14,7 +14,7 @@ if __package__ is None:
     # when this file is run directly it does not know root path to use import from above folders
     sys.path.append(str(Path(__file__).parent.parent))
 
-import main
+import __init__
 
 try:
     import pytest
@@ -60,7 +60,7 @@ class TestGeometry:
         for face in bm.faces:
             if face in visited:
                 continue
-            facade_greed = main.Geometry.connected_coplanar_faces(face)
+            facade_greed = __init__.Geometry.connected_coplanar_faces(face)
             order_i = 0
             for face_ind in facade_greed:
                 facade_face = bm.faces[face_ind]
