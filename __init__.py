@@ -1371,6 +1371,7 @@ class JoinFacadesNode(BaseNode, Node):
                             floor = facade.get_floor()
                             floor.height = sub_floor.height
                             floor.z_scale = sub_floor.z_scale
+                            floor.is_last = sub_floor.is_last
                             floors_stack.append(floor, throw_error=False)
                         # add empty panels if facades has different number of floors
                         if i > 0 and not is_floor_full:
@@ -1447,6 +1448,8 @@ class FacadeNode(BaseNode, Node):
                 floors_stack = ShapesStack(request_size.y)
                 floors_stack.extend(get_floors(inputs.first, count()), throw_error=False)
                 last_floors = get_floors(inputs.last, count())
+                for floor in last_floors:
+                    floor.is_last = True
                 floors_stack.extend(last_floors, throw_error=False)
                 # fill floors
                 if not floors_stack.is_full:
@@ -2374,9 +2377,12 @@ class Panel(Shape):
         self.mirror_y = False
 
     def copy(self):
-        panel = Panel(self.obj_index, self.size)
-        panel.scale = self.scale
+        panel = Panel(self.obj_index, self.size.copy())
+        panel.scale = self.scale.copy()
         panel.probability = self.probability
+        panel.is_scalable = self.is_scalable
+        panel.mirror_x = self.mirror_x
+        panel.mirror_y = self.mirror_y
         return panel
 
     @property
@@ -2414,7 +2420,12 @@ class PanelShell(Shape):
 
     def copy(self):
         shell = PanelShell()
-        shell._sub_panels = self._sub_panels
+        shell._sub_panels = [p.copy() for p in self._sub_panels]
+        shell._sub_positions = [v.copy() for v in self._sub_positions]
+        shell.size = self.size.copy()
+        shell.scale = self.scale.copy()
+        shell.mirror_x = self.mirror_x
+        shell.mirror_y = self.mirror_y
         return shell
 
     @property
@@ -2472,11 +2483,16 @@ class Floor(Shape):
         self.height = None
         self.is_scalable = True
 
+        # util props
+        self.is_last = False
+
     def copy(self, facade: 'Facade'):
         floor = Floor(facade, self.panels_stack.max_width)
         floor.height = self.height
         floor.z_scale = self.z_scale
         floor.panels_stack = self.panels_stack.copy()
+        floor.is_scalable = self.is_scalable
+        floor.is_last = self.is_last
         return floor
 
     @property
@@ -2785,22 +2801,42 @@ class Facade:
                 current_range -= self.size.y - self.floors_stack.width
             z_factor = (current_range.length - (height - scalable_height)) / scalable_height
 
-            current_range = DistSlice(current_range.stop, current_range.stop)
+            for face_i, is_last, panels_range in first_panel_cells:
 
-            for face_i, panels_range in first_panel_cells:
+                # replace top floors if necessary
+                fixed_floors = None
+                is_top = floors[-1] == self.floors_stack[-1]
+                if is_last and not is_top:
+                    last_fs = []
+                    for floor in reversed(self.floors_stack):
+                        if floor.is_last:
+                            last_fs.append(floor.copy(self))
+                        else:
+                            break
+                    last_fs.reverse()
+                    if last_fs:
+                        fixed_floors: ShapesStack[floors] = ShapesStack(current_range.length)
+                        fixed_floors.extend([f.copy(self) for f in floors])
+                        # for floor in fixed_floors:
+                        #     floor.is_scalable = False
+                        last_fs_height = sum(f.stack_size for f in last_fs)
+                        fixed_floors.replace(last_fs, DistSlice(current_range.stop - last_fs_height, current_range.stop))
+                        fixed_floors.fit_scale()
+
                 face = build._base_bm.faces[face_i]
                 start, max_l = Geometry.get_bounding_loops(face)
                 direction = Vector((0, 0, 1))
                 panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
                 z_shift = 0
-                for floor in floors:
-                    f_z_factor = z_factor if floor.is_scalable else 1
+                for floor in fixed_floors or floors:
+                    f_z_factor = z_factor if floor.is_scalable and not fixed_floors else 1
                     size = floor.stack_size * f_z_factor
                     z_shift += size / 2
                     floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal,
                                       panels_range, f_z_factor)
                     z_shift += size / 2
 
+            current_range = DistSlice(current_range.stop, current_range.stop)
             floors.clear()
             first_panel_cells = None
 
@@ -2883,7 +2919,7 @@ class CentredMeshGrid:
     array([1., 3.])
     >>> [fi for fi in gr]
     [0, 1, 2]
-    >>> print("\\n".join([str((i, d, d2)) for d, w in gr.cells_and_positions() for i, d2 in w]))
+    >>> print("\\n".join([str((i, d, d2)) for d, w in gr.cells_and_positions() for i, _, d2 in w]))
     (0, <DistSlice(0.00, 1.00)>, <DistSlice(0.00, 1.00)>)
     (1, <DistSlice(0.00, 1.00)>, <DistSlice(1.00, 3.00)>)
     (2, <DistSlice(1.00, 4.00)>, <DistSlice(0.00, 1.00)>)
@@ -2911,16 +2947,18 @@ class CentredMeshGrid:
     def size(self) -> Vector:
         return Vector((np.sum(self._size_x[self._size_x > 0]), np.sum(self._size_y[self._size_y > 0])))
 
-    def cells_and_positions(self) -> Iterator[tuple[DistSlice, Iterator[tuple[int, DistSlice]]]]:
+    def cells_and_positions(self) -> Iterator[tuple[DistSlice, Iterator[tuple[int, bool, DistSlice]]]]:
         cum_size_x = list(accumulate(self._size_x, initial=0))
         cum_size_y = list(accumulate(self._size_y, initial=0))
 
-        def walk_along_x(_row):
+        def walk_along_x(_i_row, _row):
             for i_col, face_ind in enumerate(_row):
                 if face_ind != -1:
-                    yield face_ind, DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
+                    is_last = len(self._grid) == (_i_row + 1) or self._grid[_i_row + 1][i_col] == -1
+                    yield face_ind, is_last, DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
+
         for i_row, row in enumerate(self._grid):
-            yield DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]), walk_along_x(row)
+            yield DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]), walk_along_x(i_row, row)
 
     def corner_cells(self) -> tuple[int, int]:
         left = next(fi[0] for fi in self._grid if fi[0] != -1)
