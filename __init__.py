@@ -300,7 +300,7 @@ class BuildingStyleTree(NodeTree):
                 for key, sock in socks.items():
                     is_deprecated = not hasattr(node.input_template, key)
                     if is_deprecated and node.repeat_last_socket:
-                        if sock.bl_idname in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname, FloatSocket.bl_idname}:
+                        if sock.bl_idname == node.input_template[-1].type.bl_idname:
                             if sock.bl_idname == node.inputs[-1].bl_idname:
                                 is_deprecated = False
                     sock.is_deprecated = is_deprecated
@@ -514,6 +514,15 @@ class EnumSocket(BaseSocket, NodeSocket):
     items_ref: StringProperty(description="Path to the items")
 
 
+class InputSocket(BaseSocket, NodeSocket):
+    """Generic socket"""
+    bl_idname = 'bn_InputSocket'
+    bl_lable = "Input Socket"
+    default_shape = 'DIAMOND_DOT'
+    default_name = "Input"
+    color = 0.5, 0.5, 0.5, 1.0
+
+
 class Categories(Enum):
     BUILDING = auto()
     FACADE = auto()
@@ -707,7 +716,7 @@ class BaseNode:
         links = {l.to_socket: l for l in self.id_data.links}
         if self.repeat_last_socket:
             sock_id_name = self.inputs[-1].bl_idname
-            if sock_id_name in {PanelSocket.bl_idname, FloorSocket.bl_idname, FacadeSocket.bl_idname, FloatSocket.bl_idname}:
+            if sock_id_name == self.input_template[-1].type.bl_idname:
                 if self.inputs[-1].is_linked:
                     identifier = self.input_template._fields[-1] if self.input_template else ''
                     self.input_template[-1].init(self, True, identifier)
@@ -900,7 +909,7 @@ class PanelRandomizeNode(BaseNode, Node):
     repeat_last_socket = True
     settings_viewer = DefaultNodeSettings
     Inputs = namedtuple('Inputs', ['seed', 'panel'])
-    input_template = Inputs(SocketTemplate(IntSocket, 'Index'), SocketTemplate(PanelSocket))
+    input_template = Inputs(SocketTemplate(IntSocket, 'Seed'), SocketTemplate(PanelSocket))
     Outputs = namedtuple('Outputs', ['panel'])
     output_template = Outputs(SocketTemplate(PanelSocket))
     panel_props = ['probability']
@@ -1144,26 +1153,18 @@ class FloorAttributesNode(BaseNode, Node):
     bl_idname = 'bn_FloorAttributesNode'
     bl_label = "Floor Attributes"
     category = Categories.FLOOR
-    Outputs = namedtuple('Outputs', ['width', 'height', 'index'])
+    Outputs = namedtuple('Outputs', ['index'])
     output_template = Outputs(
-        SocketTemplate(FloatSocket, 'Width', display_shape='DIAMOND'),
-        SocketTemplate(FloatSocket, 'Height', display_shape='DIAMOND'),
         SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND'),
     )
 
     @staticmethod
     def execute(inputs, props):
-        def floor_width(facade: Facade):
-            return facade.size.x
-
-        def floor_height(facade: Facade):
-            return None
-
         def floor_index(facade: Facade):
             facade.depth.add('floor_index')
             return facade.cur_floor_ind
 
-        return floor_width, floor_height, floor_index
+        return floor_index
 
 
 class SelectFloorNode(BaseNode, Node):
@@ -1673,6 +1674,41 @@ class FloatValueNode(BaseNode, Node):
         def get_float(facade: Facade):
             return inputs.value(facade)
         return get_float
+
+
+class SelectInputNode(BaseNode, Node):
+    bl_idname = "bn_SelectInputNode"
+    bl_label = "Select Input"
+    repeat_last_socket = True
+    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'input'])
+    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
+    input_template = Inputs(
+        SocketTemplate(EnumSocket, 'Match mode', False, items_ref="SelectInputNode.mode_items"),
+        SocketTemplate(IntSocket, 'Index'),
+        SocketTemplate(InputSocket),
+    )
+    Outputs = namedtuple('Outputs', ['input'])
+    output_template = Outputs(SocketTemplate(InputSocket))
+    settings_viewer = DefaultNodeSettings
+
+    @staticmethod
+    def execute(inputs: Inputs, props):
+        def get_input(facade: Facade):
+            func_ind = inputs._fields.index('input')
+            input_funcs = {i: f for i, f in enumerate(inputs[func_ind:-1])}
+            mode = inputs.match_mode(facade)
+            if mode == 'NONE':
+                index = inputs.index(facade)
+            elif mode == 'REPEAT':
+                index = min(len(input_funcs) - 1, inputs.index(facade))
+            elif mode == 'CYCLE':
+                index = inputs.index(facade) % len(input_funcs)
+            else:
+                raise TypeError(f"Unknown mode {mode}")
+            input_f = input_funcs.get(int(index))
+            if input_f:
+                return input_f(facade)
+        return get_input
 
 
 class SelectValueNode(BaseNode, Node):
