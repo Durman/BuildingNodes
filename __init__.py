@@ -10,23 +10,22 @@ import sys
 import traceback
 from abc import ABC, abstractmethod
 from cProfile import Profile
-from collections import namedtuple, defaultdict, deque
+from collections import namedtuple, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import wraps
 from graphlib import TopologicalSorter
-from itertools import count, chain, cycle, repeat, accumulate, compress, dropwhile
+from itertools import count, chain, cycle, repeat, accumulate, dropwhile
 from math import isclose, inf
 from pathlib import Path
 from pstats import Stats
-from statistics import mean
 from typing import Optional, Iterable, NamedTuple, Type, get_type_hints, Literal, Any, Union, overload, Generic, \
-    TypeVar, Generator, Iterator
+    TypeVar, Iterator
 
 import bmesh
 import bpy
 import numpy as np
-from bmesh.types import BMEdge, BMFace, BMLoop, BMVert, BMesh
+from bmesh.types import BMFace, BMLoop, BMVert, BMesh
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, BoolProperty, EnumProperty
 from bpy.types import NodeTree, Node, NodeSocket, Panel, Operator, PropertyGroup, Menu, AddonPreferences
@@ -199,48 +198,6 @@ class BuildingStyleTree(NodeTree):
                     out_sock = node.outputs[i]
                 sock_data[out_sock] = data
 
-    def _get_points(self, base_bm: bmesh.types.BMesh):
-        bm = bmesh.new()
-        norm_lay = bm.verts.layers.float_vector.new("Normal")
-        scale_lay = bm.verts.layers.float_vector.new("Scale")
-        ind_lay = bm.verts.layers.int.new("Wall index")
-        wall_lay = base_bm.faces.layers.int.get("Is wall")
-        if wall_lay is None:
-            wall_lay = base_bm.faces.layers.int.new("Is wall")
-        panel_size = Vector((2, 2))
-        panel_num = len(self.inst_col.all_objects)
-        for fi, face in enumerate(base_bm.faces):
-            random.seed(fi)
-            if isclose(face.normal.dot(Vector((0, 0, 1))), 0, abs_tol=0.1):
-                min_v = Vector((min(v.co.x for v in face.verts), min(v.co.y for v in face.verts),
-                                min(v.co.z for v in face.verts)))
-                max_v = Vector((max(v.co.x for v in face.verts), max(v.co.y for v in face.verts),
-                                max(v.co.z for v in face.verts)))
-                xy_dir = (max_v - min_v) * Vector((1, 1, 0))
-                xy_len = xy_dir.length
-                xy_num = max(int(xy_len / panel_size.x), 1)
-                xy_scale = xy_len / (xy_num * panel_size.x)
-                xy_step = xy_dir.normalized() * (xy_scale * panel_size.x)
-                z_dir = (max_v - min_v) * Vector((0, 0, 1))
-                z_len = z_dir.length
-                z_num = max(int(z_len / panel_size.y), 1)
-                z_scale = z_len / (z_num * panel_size.y)
-                z_step = z_dir.normalized() * (z_scale * panel_size.y)
-                for zi in range(0, z_num):
-                    vec = bm.verts.new(min_v + xy_step * 0.5 + z_step * 0.5 + z_step * zi)
-                    vec[norm_lay] = face.normal
-                    vec[scale_lay] = (xy_scale, z_scale, 1)
-                    vec[ind_lay] = random.randrange(panel_num)
-                    for xyi in range(1, xy_num):
-                        v = bm.verts.new(vec.co + xy_step * xyi)
-                        v[norm_lay] = face.normal
-                        v[scale_lay] = (xy_scale, z_scale, 1)
-                        v[ind_lay] = random.randrange(panel_num)
-                face[wall_lay] = 1
-            else:
-                face[wall_lay] = 0
-        return bm
-
     def store_instances(self) -> bpy.types.Collection:
         if self.inst_col is None:
             self.inst_col = bpy.data.collections.new('Panel instances')
@@ -303,6 +260,9 @@ class BuildingStyleTree(NodeTree):
                         template.init(node, is_input=True, identifier=key)
                         node.inputs.move(len(node.inputs) - 1, pos)
                 for key, sock in socks.items():
+                    if sock.bl_idname == 'NodeSocketUndefined':
+                        node.inputs.remove(sock)
+                        continue
                     is_deprecated = not hasattr(node.input_template, key)
                     if is_deprecated and node.repeat_last_socket:
                         if sock.bl_idname == node.input_template[-1].type.bl_idname:
@@ -493,15 +453,6 @@ class VectorSocket(BaseSocket, NodeSocket):
     value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value)
 
 
-class Vector4Socket(BaseSocket, NodeSocket):
-    bl_idname = 'bn_Vector4Socket'
-    bl_label = "Vector 4 Socket"
-    default_shape = 'DIAMOND_DOT'
-    default_name = 'Vector4'
-    color = 0.4, 0.3, 0.7, 1.0
-    value: bpy.props.FloatVectorProperty(update=BaseSocket.update_value, size=4)
-
-
 class EnumSocket(BaseSocket, NodeSocket):
     bl_idname = 'bn_EnumSocket'
     bl_lable = "Enum Socket"
@@ -544,21 +495,6 @@ class Categories(Enum):
             Categories.BUILDING: (0.3, 0.15, 0.15),
         }
         return colors.get(self)
-
-
-class ShowSocketsMenu(Menu):
-    bl_idname = "OBJECT_MT_show_sockets"
-    bl_label = "Show/hide sockets"
-
-    def draw(self, context):
-        for sock in context.node.inputs:
-            if sock.is_linked:
-                col = self.layout.column()
-                col.active = False
-                col.prop(sock, 'is_to_show', text=(sock.name or sock.default_name) + ' (connected)', emboss=False)
-            else:
-                col = self.layout.column()
-                col.prop(sock, 'is_to_show', text=sock.name or sock.default_name)
 
 
 class SocketTemplate(NamedTuple):
@@ -856,57 +792,6 @@ class PanelAttributesNode(BaseNode, Node):
         return panel_index
 
 
-class SetPanelAttributeNode(BaseNode, Node):
-    bl_idname = 'bn_SetPanelAttributeNode'
-    bl_label = "Set Panel Attribute"
-    category = Categories.PANEL
-    Inputs = namedtuple('Inputs', ['panel', 'scalable', 'probability', 'dist_step', 'top_padding', 'bottom_padding',
-                                   'left_padding', 'right_padding', 'scope_position'])
-    Props = namedtuple('Props', ['attribute'])
-
-    def update_attribute(self, context):
-        self.inputs['Scalable'].enabled = 'scalable' == self.attribute
-        self.inputs['Probability'].enabled = 'probability' == self.attribute
-        self.inputs['Distribute step'].enabled = 'distribute step' == self.attribute
-        self.inputs['Top padding'].enabled = 'scope padding' == self.attribute
-        self.inputs['Bottom padding'].enabled = 'scope padding' == self.attribute
-        self.inputs['Left padding'].enabled = 'scope padding' == self.attribute
-        self.inputs['Right padding'].enabled = 'scope padding' == self.attribute
-        self.inputs['Scope position'].enabled = 'scope position' == self.attribute
-
-    attribute: bpy.props.EnumProperty(
-        items=[(i.lower(), i, '') for i in ['Scalable', 'Probability', 'Distribute step', 'Scope padding',
-                                            'Scope position']],
-        update=update_attribute)
-
-    def node_init(self):
-        self.inputs.new(PanelSocket.bl_idname, "")
-        self.inputs.new(BoolSocket.bl_idname, "Scalable")
-        s = self.inputs.new(FloatSocket.bl_idname, "Probability")
-        s.value = 1
-        s.display_shape = 'DIAMOND_DOT'
-        self.inputs.new(FloatSocket.bl_idname, "Distribute step").value = 3
-        self.inputs.new(FloatSocket.bl_idname, "Top padding")
-        self.inputs.new(FloatSocket.bl_idname, "Bottom padding")
-        self.inputs.new(FloatSocket.bl_idname, "Left padding")
-        self.inputs.new(FloatSocket.bl_idname, "Right padding")
-        self.inputs.new(VectorSocket.bl_idname, "Scope position")
-        self.outputs.new(PanelSocket.bl_idname, "")
-        self.update_attribute(None)
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, "attribute", text='')
-
-    @staticmethod
-    def execute(inputs: Inputs, props: Props):
-        def set_panel_attr(build: Building):
-            panel: Panel = inputs.panel(build)
-            if props.attribute == 'probability':
-                panel.probability = inputs.probability(build)
-            return panel
-        return set_panel_attr
-
-
 class PanelRandomizeNode(BaseNode, Node):
     bl_idname = 'bn_PanelRandomizeNode'
     bl_label = "Panel Randomize"
@@ -936,72 +821,6 @@ class PanelRandomizeNode(BaseNode, Node):
             panels = [p for inp in inputs[1: -1] if inp and (p := inp(facade)) is not None]
             return stream.choices(panels, weights=[p.probability for p in panels])[0]
         return randomize_panels
-
-
-class PanelSwitchNode(BaseNode, Node):
-    bl_idname = 'bn_PanelSwitchNode'
-    bl_label = "Panel Switch"
-    category = Categories.PANEL
-    Inputs = namedtuple('Inputs', ['bool', 'true_panel', 'false_panel'])
-
-    def node_init(self):
-        self.inputs.new(BoolSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
-        self.inputs.new(PanelSocket.bl_idname, "True panel")
-        self.inputs.new(PanelSocket.bl_idname, "False panel")
-        self.outputs.new(PanelSocket.bl_idname, "")
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        def switch_panel(build):
-            true_panel = inputs.true_panel(build) if inputs.true_panel else None
-            false_panel = inputs.false_panel(build) if inputs.false_panel else None
-            return true_panel if inputs.bool(build) else false_panel
-        return switch_panel
-
-
-class StackPanelsNode(BaseNode, Node):
-    bl_idname = 'bn_StackPanelsNode'
-    bl_label = "Stack Panels Node"
-    category = Categories.PANEL
-    repeat_last_socket = True
-
-    def node_init(self):
-        self.inputs.new(PanelSocket.bl_idname, "")
-        self.outputs.new(PanelSocket.bl_idname, "")
-
-
-class SelectPanelNode(BaseNode, Node):
-    bl_idname = 'bn_SelectPanelNode'
-    bl_label = "Select Panel"
-    category = Categories.PANEL
-    repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'panel'])
-    input_template = Inputs(
-        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectPanelNode.mode_items'),
-        SocketTemplate(IntSocket, 'Index'),
-        SocketTemplate(PanelSocket),
-    )
-    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
-    Outputs = namedtuple('Outputs', ['panel'])
-    output_template = Outputs(SocketTemplate(PanelSocket))
-    settings_viewer = DefaultNodeSettings
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        def get_facade_item(facade: BaseFacade):
-            panel_funcs = {i: f for i, f in enumerate(inputs[inputs._fields.index('panel'): -1])}
-            mode = inputs.match_mode(facade)
-            if mode == 'NONE':
-                index = inputs.index(facade)
-            elif mode == 'REPEAT':
-                index = min(len(panel_funcs) - 1, inputs.index(facade))
-            elif mode == 'CYCLE':
-                index = inputs.index(facade) % len(panel_funcs)
-            panel_f = panel_funcs.get(int(index))
-            if panel_f:
-                return panel_f(facade)
-
-        return get_facade_item
 
 
 class MirrorPanelNode(BaseNode, Node):
@@ -1170,117 +989,6 @@ class FloorAttributesNode(BaseNode, Node):
             return facade.cur_floor_ind
 
         return floor_index
-
-
-class SelectFloorNode(BaseNode, Node):
-    bl_idname = 'bn_SelectFloorNode'
-    bl_label = 'Select Floor'
-    category = Categories.FLOOR
-    repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'floor'])
-    input_template = Inputs(
-        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectFloorNode.mode_items'),
-        SocketTemplate(IntSocket, 'Index', display_shape='DIAMOND_DOT'),
-        SocketTemplate(FloorSocket),
-    )
-    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
-    Outputs = namedtuple('Outputs', ['floor'])
-    output_template = Outputs(SocketTemplate(FloorSocket))
-    settings_viewer = DefaultNodeSettings
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        def select_floor(facade: BaseFacade):
-            func_ind = inputs._fields.index('floor')
-            floor_funcs = {i: f for i, f in enumerate(inputs[func_ind:-1])}
-            mode = inputs.match_mode(facade)
-            if mode == 'NONE':
-                index = inputs.index(facade)
-            elif mode == 'REPEAT':
-                index = min(len(floor_funcs) - 1, inputs.index(facade))
-            elif mode == 'CYCLE':
-                index = inputs.index(facade) % len(floor_funcs)
-            else:
-                raise TypeError(f"Unknown mode {mode}")
-            panel_f = floor_funcs.get(int(index))
-            return panel_f and panel_f(facade) or []
-        return select_floor
-
-
-class FloorSwitchNode(BaseNode, Node):
-    bl_idname = 'bn_FloorSwitchNode'
-    bl_label = "Floor Switch"
-    category = Categories.FLOOR
-    Inputs = namedtuple('Inputs', ['bool', 'true_floor', 'false_floor'])
-
-    def node_init(self):
-        self.inputs.new(BoolSocket.bl_idname, "").display_shape = 'DIAMOND_DOT'
-        self.inputs.new(FloorSocket.bl_idname, "True floor")
-        self.inputs.new(FloorSocket.bl_idname, "False floor")
-        self.outputs.new(FloorSocket.bl_idname, "")
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        catch = dict()
-        depth = set()
-        last_facade = None
-
-        def switch_floor(facade: BaseFacade):
-            def get_input(func):
-                if func is None:
-                    return None
-                elif func not in catch:
-                    facade.depth.clear()
-                    sock_input = func(facade)
-                    catch[func] = None if facade.depth else sock_input
-                    depth.update(facade.depth)
-                    return sock_input
-                elif (sock_input := catch[func]) is not None:
-                    try:
-                        return [f.copy(facade) for f in sock_input]
-                    except TypeError:
-                        return sock_input
-                else:
-                    return func(facade)
-
-            if inputs.bool is None:
-                return []
-            nonlocal last_facade
-            if facade != last_facade:  # the catch should exist per facade
-                last_facade = facade
-                catch.clear()
-                depth.clear()
-
-            floors = get_input(inputs.true_floor) if get_input(inputs.bool) else get_input(inputs.false_floor)
-            facade.depth = depth.copy()  # should be last
-            return floors or []
-
-        return switch_floor
-
-
-class ChainFloorsNode(BaseNode, Node):
-    bl_idname = 'bn_ChainFloorsNode'
-    bl_label = "Chain Floors"
-    category = Categories.FLOOR
-    repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['floor0', 'floor1', 'floor2', 'floor3'])
-
-    def node_init(self):
-        self.inputs.new(FloorSocket.bl_idname, "")
-        self.outputs.new(FloorSocket.bl_idname, "")
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        def chain_floors(facade: BaseFacade):
-            floors_chain = []
-            shift_floor_ind = count()
-            for floor_f in filter(bool, inputs[::-1]):
-                facade.cur_floor_ind += next(shift_floor_ind)
-                floors = floor_f(facade)
-                if floors:
-                    floors_chain.extend(floors)
-            return floors_chain
-        return chain_floors
 
 
 class JoinFloorsNode(BaseNode, Node):
@@ -1482,64 +1190,6 @@ class FacadeAttributesNode(BaseNode, Node):
         return facade_height, facade_length, left_corner_angle, right_corner_angle, material_id, facade_index
 
 
-class SetFacadeAttributeNode(BaseNode, Node):
-    bl_idname = 'bn_SetFacadeAttributeNode'
-    bl_label = "Set Facade Attribute"
-    category = Categories.FACADE
-
-    def update_attribute(self, context):
-        self.inputs['Name'].enabled = 'Name' == self.attribute
-
-    attribute: bpy.props.EnumProperty(
-        items=[(i, i, '') for i in ['Name', ]],
-        update=update_attribute)
-
-    def node_init(self):
-        self.inputs.new(FacadeSocket.bl_idname, "")
-        self.inputs.new(StringSocket.bl_idname, "Name")
-        self.outputs.new(FacadeSocket.bl_idname, "")
-        self.update_attribute(None)
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, "attribute", text='')
-
-
-class SelectFacadeNode(BaseNode, Node):
-    bl_idname = 'bn_SelectFacadeNode'
-    bl_label = "Select Facade"
-    category = Categories.FACADE
-    repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'facade'])
-    input_template = Inputs(
-        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectFacadeNode.mode_items'),
-        SocketTemplate(IntSocket, 'Index'),
-        SocketTemplate(FacadeSocket),
-    )
-    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
-    Outputs = namedtuple('Outputs', ['facade'])
-    output_template = Outputs(SocketTemplate(FacadeSocket))
-    settings_viewer = DefaultNodeSettings
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        def get_facade_item(facade: BaseFacade):
-            facade_funcs = {i: f for i, f in enumerate(inputs[inputs._fields.index('facade'):-1])}
-            mode = inputs.match_mode(facade)
-            if mode == 'NONE':
-                index = inputs.index(facade)
-            elif mode == 'REPEAT':
-                index = min(len(facade_funcs) - 1, inputs.index(facade))
-            elif mode == 'CYCLE':
-                index = inputs.index(facade) % len(facade_funcs)
-            else:
-                raise TypeError(f"Unknown mode {mode}")
-            facade_f = facade_funcs.get(index)
-            if facade_f:
-                return facade_f(facade)
-
-        return get_facade_item
-
-
 class MathNode(BaseNode, Node):
     bl_idname = 'bn_MathNode'
     bl_label = "Math"
@@ -1675,40 +1325,6 @@ class SelectInputNode(BaseNode, Node):
             if input_f:
                 return input_f(facade)
         return get_input
-
-
-class SelectValueNode(BaseNode, Node):
-    bl_idname = "bn_SelectValueNode"
-    bl_label = "Select value"
-    repeat_last_socket = True
-    Inputs = namedtuple('Inputs', ['match_mode', 'index', 'value'])
-    input_template = Inputs(
-        SocketTemplate(EnumSocket, 'Match mode', False, items_ref='SelectValueNode.mode_items'),
-        SocketTemplate(IntSocket, 'Index'),
-        SocketTemplate(FloatSocket),
-    )
-    mode_items = [(i, i.capitalize(), '') for i in ['NONE', 'REPEAT', 'CYCLE']]
-    Outputs = namedtuple('Outputs', ['value'])
-    output_template = Outputs(SocketTemplate(FloatSocket))
-    settings_viewer = DefaultNodeSettings
-
-    @staticmethod
-    def execute(inputs: Inputs, props):
-        def select_value(facade: BaseFacade):
-            func_ind = inputs._fields.index('value')
-            value_funcs = {i: f for i, f in enumerate(inputs[func_ind:])}
-            mode = inputs.match_mode(facade)
-            if mode == 'NONE':
-                index = inputs.index(facade)
-            elif mode == 'REPEAT':
-                index = min(len(value_funcs) - 1, inputs.index(facade))
-            elif mode == 'CYCLE':
-                index = inputs.index(facade) % len(value_funcs)
-            else:
-                raise TypeError(f"Unknown mode {mode}")
-            value_f = value_funcs.get(int(index))
-            return value_f(facade)
-        return select_value
 
 
 class ComparisonMathNode(BaseNode, Node):
@@ -2091,65 +1707,6 @@ class EditSocketsOperator(Operator):
 
     def draw(self, context):
         self.layout.prop(self, 'new_socket_name')
-
-
-class EditBuildingAttributesOperator(Operator):
-    bl_idname = "bn.edit_building_attributes"
-    bl_label = "Edit facade attributes"
-    bl_options = {'INTERNAL', }
-
-    operation: bpy.props.EnumProperty(items=[(i, i, '') for i in ['add', 'remove', 'rename']])
-    attr_name: bpy.props.StringProperty()
-    new_attr_name: bpy.props.StringProperty(description='New facade name to rename')
-
-    @classmethod
-    def description(cls, context, properties):
-        descriptions = {
-            'rename': "Replace values with style name to new style name",
-            'add': f'Assign selected faces to "{properties.attr_name}" style',
-            'remove': f'Remove selected faces from "{properties.attr_name}" style',
-        }
-        return descriptions[properties.operation]
-
-    @classmethod
-    def poll(cls, context):
-        return context.object
-
-    def execute(self, context):
-        obj = context.object
-        if context.object.mode != 'EDIT' and self.operation in {'add', 'remove'}:
-            self.report('ERROR_INVALID_CONTEXT',
-                        f'The operator does not support "{self.operation}" operation in object mode')
-            return {'CANCELLED'}
-        if context.object.mode == 'EDIT':
-            bm = bmesh.from_edit_mesh(obj.data)
-            f_lay = bm.faces.layers.string.get(FACE_STYLE_LAYER_NAME)
-            if f_lay is None:
-                f_lay = bm.faces.layers.string.new(FACE_STYLE_LAYER_NAME)
-        if self.operation == 'add':
-            for face in (f for f in bm.faces if f.select):
-                face[f_lay] = self.attr_name.encode()
-        elif self.operation == 'remove':
-            for face in (f for f in bm.faces if f.select):
-                if face[f_lay].decode() == self.attr_name:
-                    face[f_lay] = ''.encode()
-        elif self.operation == 'rename':
-            if obj.mode == 'EDIT':
-                for face in bm.faces:
-                    if face[f_lay].decode() == self.attr_name:
-                        face[f_lay] = self.new_attr_name.encode()
-            else:
-                attr = obj.data.attributes.get(FACE_STYLE_LAYER_NAME)
-                if attr is None:
-                    attr = obj.data.attributes.new(FACE_STYLE_LAYER_NAME, 'STRING', 'FACE')
-                for face_attr in attr.data.values():
-                    if face_attr.value == self.attr_name:
-                        face_attr.value = self.new_attr_name
-        try:
-            obj.building_props.building_style.apply(obj)
-        except:
-            traceback.print_exc()
-        return {'FINISHED'}
 
 
 class EditPanelAttributesOperator(Operator):
@@ -2883,7 +2440,6 @@ class BaseFacade:
             yield None
         finally:
             self.read_props = current_state
-
 
     @contextmanager
     def size_context(self, size: Vector = None):
