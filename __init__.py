@@ -1899,6 +1899,11 @@ class DistSlice:
             self.stop = self.stop - other
         return self
 
+    def __eq__(self, other: 'DistSlice'):
+        if isinstance(other, DistSlice):
+            return self.start == other.start and self.stop == other.stop
+        return NotImplemented
+
     def __repr__(self):
         start = self.start.__format__('.2f') if self.start is not None else None
         stop = self.stop.__format__('.2f') if self.stop is not None else None
@@ -2062,18 +2067,19 @@ class Floor(Shape):
     def scale_along_stack(self, factor: float):
         self.z_scale *= factor
 
-    def do_instance(self, build: 'Building', start: Vector, direction: Vector, normal: Vector, panels_range: DistSlice,
+    def do_instance(self, build: 'Building', start: Vector, direction: Vector, normal: Vector, cell: 'GridCell',
                     z_factor):
         """    +--+--+--+   3D
         start  *  │  │  │
                +--+--+--+--------→ direction
         """
         xy_shift = 0
-        panels = self.panels_stack[panels_range]
+        panels = cell.pick_panels(self)
         width = sum(p.stack_size for p in panels)
         scalable_width = sum(p.stack_size for p in panels if p.is_scalable)
+        panels_range = cell.x_range
         if panels and panels[-1] == self.panels_stack[-1]:
-            panels_range = panels_range - (build.cur_facade.size.x - self.panels_stack.width)
+            panels_range = cell.x_range - (build.cur_facade.size.x - self.panels_stack.width)
         xy_factor = (panels_range.length - (width - scalable_width)) / scalable_width
         for panel in panels:
             p_xy_factor = xy_factor if panel.is_scalable else 1
@@ -2227,6 +2233,8 @@ class ShapesStack(Generic[ShapeType]):
     @overload
     def __getitem__(self, key: int) -> ShapeType: ...
     @overload
+    def __getitem__(self, key: float) -> ShapeType: ...
+    @overload
     def __getitem__(self, key: slice) -> list[ShapeType]: ...
     @overload
     def __getitem__(self, key: DistSlice) -> list[ShapeType]: ...
@@ -2236,6 +2244,9 @@ class ShapesStack(Generic[ShapeType]):
             return self._shapes[key]
         if isinstance(key, DistSlice):
             return self._shapes[self._range_to_indexes(key)]
+        if isinstance(key, float):
+            position = bisect.bisect(self._cum_width, key) - 1
+            return self._shapes[position]
         raise TypeError
 
     @overload
@@ -2282,8 +2293,8 @@ class ShapesStack(Generic[ShapeType]):
 
 
 class Facade:
-    def __init__(self, length: float):
-        self.floors_stack: ShapesStack[Floor] = ShapesStack(length)
+    def __init__(self, height: float):
+        self.floors_stack: ShapesStack[Floor] = ShapesStack(height)
 
     def join_along_x(self, facade: 'Facade', length):
         is_floor_full = False
@@ -2332,77 +2343,60 @@ class Facade:
                 │  floor     │
         start   *------------+-----→ Panels direction
         """
-        floor_rows = grid.cells_and_positions()
-        current_range = DistSlice(0, 0)
-        is_empty = False
-        first_panel_cells = None
-        floors = []
-        for _ in range(1000):
-            try:
-                floors_range, panel_cells = next(floor_rows)
-            except StopIteration:
-                is_empty = True
-            else:
-                if first_panel_cells is None:
-                    first_panel_cells = panel_cells
-                floors.extend(self.floors_stack[floors_range])
-                current_range += floors_range.length
-
-            if is_empty and not floors:
-                break
-
-            # the floor row is too small
-            if not is_empty and not floors:
+        used_faces = set()
+        for cell in grid:
+            if all(fi in used_faces for fi in cell.face_indexes):
                 continue
+            elif any(fi in used_faces for fi in cell.face_indexes):
+                raise RuntimeError("Some polygon was already handled")
 
-            # check if there is unused top rows
-            if not is_empty and floors[-1] == self.floors_stack[-1]:
+            cell = cell.fit_to_shape(self.floors_stack)
+            if cell is None:
                 continue
+            used_faces.update(cell.face_indexes)
+            floors = cell.pick_floors(self.floors_stack)
+
+            # fix range in case if facade does not cover ful height
+            current_range = cell.y_range
+            if floors[-1] == self.floors_stack[-1]:
+                current_range -= build.cur_facade.size.y - self.floors_stack.width
 
             height = sum(f.stack_size for f in floors)
             scalable_height = sum(f.stack_size for f in floors if f.is_scalable)
-            if floors[-1] == self.floors_stack[-1]:
-                current_range -= build.cur_facade.size.y - self.floors_stack.width
             z_factor = (current_range.length - (height - scalable_height)) / scalable_height
 
-            for face_i, is_last, panels_range in first_panel_cells:
+            # replace top floors if necessary
+            fixed_floors = None
+            is_top = floors[-1] == self.floors_stack[-1]
+            if cell.is_top and not is_top:
+                last_fs = []
+                for floor in reversed(self.floors_stack):
+                    if floor.is_last:
+                        last_fs.append(floor.copy(self))
+                    else:
+                        break
+                last_fs.reverse()
+                if last_fs:
+                    fixed_floors: ShapesStack[floors] = ShapesStack(current_range.length)
+                    fixed_floors.extend([f.copy(build.cur_facade) for f in floors])
+                    # for floor in fixed_floors:
+                    #     floor.is_scalable = False
+                    last_fs_height = sum(f.stack_size for f in last_fs)
+                    fixed_floors.replace(last_fs, DistSlice(current_range.stop - last_fs_height, current_range.stop))
+                    fixed_floors.fit_scale()
 
-                # replace top floors if necessary
-                fixed_floors = None
-                is_top = floors[-1] == self.floors_stack[-1]
-                if is_last and not is_top:
-                    last_fs = []
-                    for floor in reversed(self.floors_stack):
-                        if floor.is_last:
-                            last_fs.append(floor.copy(self))
-                        else:
-                            break
-                    last_fs.reverse()
-                    if last_fs:
-                        fixed_floors: ShapesStack[floors] = ShapesStack(current_range.length)
-                        fixed_floors.extend([f.copy(build.cur_facade) for f in floors])
-                        # for floor in fixed_floors:
-                        #     floor.is_scalable = False
-                        last_fs_height = sum(f.stack_size for f in last_fs)
-                        fixed_floors.replace(last_fs, DistSlice(current_range.stop - last_fs_height, current_range.stop))
-                        fixed_floors.fit_scale()
-
-                face = build._base_bm.faces[face_i]
-                start, max_l = Geometry.get_bounding_loops(face)
-                direction = Vector((0, 0, 1))
-                panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
-                z_shift = 0
-                for floor in fixed_floors or floors:
-                    f_z_factor = z_factor if floor.is_scalable and not fixed_floors else 1
-                    size = floor.stack_size * f_z_factor
-                    z_shift += size / 2
-                    floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal,
-                                      panels_range, f_z_factor)
-                    z_shift += size / 2
-
-            current_range = DistSlice(current_range.stop, current_range.stop)
-            floors.clear()
-            first_panel_cells = None
+            face = build._base_bm.faces[cell.face_indexes[0]]
+            start, max_l = Geometry.get_bounding_loops(face)
+            direction = Vector((0, 0, 1))
+            panels_direction = ((max_l.vert.co - start.vert.co) * Vector((1, 1, 0))).normalized()
+            z_shift = 0
+            for floor in fixed_floors or floors:
+                f_z_factor = z_factor if floor.is_scalable and not fixed_floors else 1
+                size = floor.stack_size * f_z_factor
+                z_shift += size / 2
+                floor.do_instance(build, start.vert.co + direction * z_shift, panels_direction, face.normal,
+                                  cell, f_z_factor)
+                z_shift += size / 2
 
     def __repr__(self):
         floors = '\n'.join([repr(floor) for floor in self.floors_stack[::-1]])
@@ -2486,8 +2480,8 @@ class Building:
                 self.cur_facade = facade
                 yield facade, facade_grid
 
-                for face_ind in facade_grid:
-                    _face = self._base_bm.faces[face_ind]
+                for cell in facade_grid:
+                    _face = self._base_bm.faces[cell.face_indexes[0]]
                     visited.add(_face)
                     _face[wall_lay] = 1
             else:
@@ -2499,6 +2493,202 @@ class Building:
         north = Vector((0, 1, 0))
         is_right = vec.cross(north).normalized().z < 0
         return vec @ north + 3 if is_right else 1 - vec @ north
+
+
+class GridCell:
+    """
+    >>> gr = CentredMeshGrid()
+    >>> gr.add(Vector((0, 0)), Vector((1., 1.)), 0)
+    >>> gr.add(Vector((1, 0)), Vector((2., 1.)), 1)
+    >>> gr.add(Vector((0, 1)), Vector((1., 2.)), 2)
+    >>> gr.add(Vector((1, 1)), Vector((2., 2.)), 3)
+    >>> gr.add(Vector((1, 2)), Vector((2., 2.)), 4)
+    >>> gr.clean_grid()
+    >>> gr
+    array([[-1,  4],
+           [ 2,  3],
+           [ 0,  1]])
+    >>> first_cell = next(iter(gr))
+    >>> first_cell
+    array([[0]])
+    >>> first_cell.x_range
+    <DistSlice(0.00, 1.00)>
+    >>> first_cell.is_right
+    False
+    >>> first_cell.is_top
+    False
+    >>> first_cell.face_indexes
+    [0]
+    >>> joined_cell = first_cell.join_up()
+    >>> joined_cell
+    array([[0],
+           [2]])
+    >>> joined_cell.join_up()
+    Traceback (most recent call last):
+        ...
+    RuntimeError: Up row can't be appended
+    >>> joined_cell = joined_cell.join_right()
+    >>> joined_cell
+    array([[0, 1],
+           [2, 3]])
+    >>> joined_cell.x_range
+    <DistSlice(0.00, 3.00)>
+    >>> joined_cell.y_range
+    <DistSlice(0.00, 3.00)>
+    >>> joined_cell.is_top
+    False
+    >>> joined_cell.is_right
+    True
+    >>> joined_cell.face_indexes
+    [0, 1, 2, 3]
+    >>> visited_cells = set(gr)
+    >>> visited_cells.update(gr)
+    >>> len(visited_cells)
+    5
+    """
+    def __init__(self, grid, row_range: slice, col_range: slice):
+        if -1 in grid.cell_data[row_range, col_range]:
+            raise TypeError(f"There are empty cells in given range ({grid.cell_data[row_range, col_range]})")
+
+        self._grid: CentredMeshGrid = grid
+        self._row_range: slice = row_range
+        self._col_range: slice = col_range
+
+    @property
+    def x_range(self) -> DistSlice:
+        return DistSlice(self._grid.cum_size_x[self._col_range.start], self._grid.cum_size_x[self._col_range.stop])
+
+    @property
+    def y_range(self) -> DistSlice:
+        return DistSlice(self._grid.cum_size_y[self._row_range.start], self._grid.cum_size_y[self._row_range.stop])
+
+    @property
+    def is_top(self) -> bool:
+        is_last_row = len(self._grid.cell_data) == self._row_range.stop
+        widest_cell_i = max((i for i in range(self._col_range.start, self._col_range.stop)),
+                            key=lambda i: self._grid.size_x[i])
+        return is_last_row or self._grid.cell_data[self._row_range.stop, widest_cell_i] == -1
+
+    @property
+    def is_right(self) -> bool:
+        is_last_column = len(self._grid.cell_data[0]) == self._col_range.stop
+        return is_last_column or -1 in self._grid.cell_data[self._row_range, self._col_range.stop]
+
+    @property
+    def face_indexes(self) -> list[int]:
+        return self._grid.cell_data[self._row_range, self._col_range].flatten().tolist()
+
+    def join_up(self) -> 'GridCell':
+        if not self.is_top:
+            try:
+                new_row_range = slice(self._row_range.start, self._row_range.stop+1)
+                return GridCell(self._grid, new_row_range, self._col_range)
+            except TypeError:
+                pass
+        raise RuntimeError(f"Up row can't be appended")
+
+    def join_right(self) -> 'GridCell':
+        if not self.is_right:
+            try:
+                new_col_range = slice(self._col_range.start, self._col_range.stop+1)
+                return GridCell(self._grid, self._row_range, new_col_range)
+            except TypeError:
+                pass
+        raise RuntimeError(f"Right column can't be appended")
+
+    def fit_to_shape(self, floors: ShapesStack[Floor]) -> Optional['GridCell']:
+
+        # join along Y
+        joined_cell = None
+        floors_in_range = None
+        nothing_to_join = False
+        for _ in range(1000):
+            try:
+                if joined_cell is None:
+                    joined_cell = self
+                else:
+                    joined_cell = joined_cell.join_up()
+            except RuntimeError:
+                nothing_to_join = True
+
+            floors_in_range = floors[joined_cell.y_range]
+            # if last cell is too short to fit a floor
+            if nothing_to_join and not floors_in_range:
+                floors_in_range = joined_cell.pick_floors(floors)
+                if not floors_in_range:
+                    return None
+                break
+
+            # the floor row is too small
+            if not nothing_to_join and not floors_in_range:
+                continue
+
+            # check if there is unused top rows
+            if not nothing_to_join and floors[-1] == floors_in_range[-1]:
+                continue
+
+            break
+
+        # join along X
+        nothing_to_join = False
+        start_cell = joined_cell
+        joined_cell = None
+        for _ in range(1000):
+            try:
+                if joined_cell is None:
+                    joined_cell = start_cell
+                else:
+                    joined_cell = joined_cell.join_right()
+            except RuntimeError:
+                nothing_to_join = True
+
+            panels = [f.panels_stack[joined_cell.x_range] for f in floors_in_range]
+            if nothing_to_join and not all(panels):
+                panels = [joined_cell.pick_panels(f) for f in floors_in_range]
+                if not all(panels):
+                    return None
+                break
+
+            # the column is too small
+            if not nothing_to_join and not all(panels):
+                continue
+
+            # check if there is unused right columns
+            if not nothing_to_join and any([ps[-1] == f.panels_stack[-1] for ps, f in zip(panels, floors_in_range)]):
+                continue
+
+            break
+        return joined_cell
+
+    def pick_floors(self, floors: ShapesStack[Floor]) -> list[Floor]:
+        f_in_range = floors[self.y_range]
+        if not f_in_range:
+            try:
+                f_in_range.append(floors[self.y_range.start + self.y_range.length / 2])
+            except IndexError:
+                pass
+        return f_in_range
+
+    def pick_panels(self, floor: Floor) -> list[Panel]:
+        panels = floor.panels_stack[self.x_range]
+        if not panels:
+            try:
+                panels.append(floor.panels_stack[self.x_range.start + self.x_range.length / 2])
+            except IndexError:
+                pass
+        return panels
+
+    def __eq__(self, other: 'GridCell'):
+        if isinstance(other, GridCell):
+            return id(self._grid) == id(other._grid) and self._row_range == other._row_range \
+                   and self._col_range == other._col_range
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((self._grid, self._row_range.start, self._row_range.stop, self._col_range.start, self._col_range.stop))
+
+    def __repr__(self):
+        return repr(self._grid.cell_data[self._row_range, self._col_range])
 
 
 class CentredMeshGrid:
@@ -2515,74 +2705,66 @@ class CentredMeshGrid:
     >>> gr.add(Vector((1, 0)), Vector((2., 1.)), 1)
     >>> gr.add(Vector((0, 1)), Vector((1., 3.)), 2)
     >>> gr.clean_grid()
-    >>> gr._grid
+    >>> gr.cell_data
     array([[ 0,  1],
            [ 2, -1]])
-    >>> gr._size_x
+    >>> gr.size_x
     array([1., 2.])
-    >>> gr._size_y
+    >>> gr.size_y
     array([1., 3.])
-    >>> [fi for fi in gr]
+    >>> [fi.face_indexes[0] for fi in gr]
     [0, 1, 2]
-    >>> print("\\n".join([str((i, d, d2)) for d, w in gr.cells_and_positions() for i, _, d2 in w]))
-    (0, <DistSlice(0.00, 1.00)>, <DistSlice(0.00, 1.00)>)
-    (1, <DistSlice(0.00, 1.00)>, <DistSlice(1.00, 3.00)>)
-    (2, <DistSlice(1.00, 4.00)>, <DistSlice(0.00, 1.00)>)
     """
+
     def __init__(self):
-        self._grid = np.full((100, 100), -1)
-        self._size_x = np.full(100, -1.0)
-        self._size_y = np.full(100, -1.0)
+        self.cell_data: np.array[int] = np.full((100, 100), -1)
+        self.size_x = np.full(100, -1.0)
+        self.size_y = np.full(100, -1.0)
 
         self._center_row = 50
         self._center_col = 50
 
+        self.cum_size_x = None
+        self.cum_size_y = None
+
     def add(self, cord: Vector, size: Vector, face_ind: int):
+        if self.cum_size_x is not None:
+            raise RuntimeError("Can't add new items to initialized grid")
         grid_pos = self._to_ind(cord)
-        self._grid[grid_pos] = face_ind
-        self._size_x[grid_pos[1]] = size.x
-        self._size_y[grid_pos[0]] = size.y
+        self.cell_data[grid_pos] = face_ind
+        self.size_x[grid_pos[1]] = size.x
+        self.size_y[grid_pos[0]] = size.y
 
     def clean_grid(self):
-        self._size_x = self._size_x[np.any(self._grid != -1, 0)]
-        self._size_y = self._size_y[np.any(self._grid != -1, 1)]
-        self._grid = self._grid[..., np.any(self._grid != -1, 0)][np.any(self._grid != -1, 1), ...]
+        self.size_x = self.size_x[np.any(self.cell_data != -1, 0)]
+        self.size_y = self.size_y[np.any(self.cell_data != -1, 1)]
+        self.cell_data = self.cell_data[..., np.any(self.cell_data != -1, 0)][np.any(self.cell_data != -1, 1), ...]
+        self.cum_size_x = list(accumulate(self.size_x, initial=0))
+        self.cum_size_y = list(accumulate(self.size_y, initial=0))
 
     @property
     def size(self) -> Vector:
-        return Vector((np.sum(self._size_x[self._size_x > 0]), np.sum(self._size_y[self._size_y > 0])))
-
-    def cells_and_positions(self) -> Iterator[tuple[DistSlice, Iterator[tuple[int, bool, DistSlice]]]]:
-        cum_size_x = list(accumulate(self._size_x, initial=0))
-        cum_size_y = list(accumulate(self._size_y, initial=0))
-
-        def walk_along_x(_i_row, _row):
-            for i_col, face_ind in enumerate(_row):
-                if face_ind != -1:
-                    is_last = len(self._grid) == (_i_row + 1) or self._grid[_i_row + 1][i_col] == -1
-                    yield face_ind, is_last, DistSlice(cum_size_x[i_col], cum_size_x[i_col + 1])
-
-        for i_row, row in enumerate(self._grid):
-            yield DistSlice(cum_size_y[i_row], cum_size_y[i_row + 1]), walk_along_x(i_row, row)
+        return Vector((np.sum(self.size_x[self.size_x > 0]), np.sum(self.size_y[self.size_y > 0])))
 
     def corner_cells(self) -> tuple[int, int]:
-        left = next(fi[0] for fi in self._grid if fi[0] != -1)
-        right = next(fi[-1] for fi in self._grid if fi[-1] != -1)
+        left = next(fi[0] for fi in self.cell_data if fi[0] != -1)
+        right = next(fi[-1] for fi in self.cell_data if fi[-1] != -1)
         return left, right
 
     def _to_ind(self, coord: Vector) -> tuple[int, int]:
         return self._center_row + int(coord.y), self._center_col + int(coord.x)
 
-    def __iter__(self):
-        def face_indexes() -> Iterable[int]:
-            for row in self._grid:
-                for face_ind in row:
-                    if face_ind != -1:
-                        yield face_ind
-        return face_indexes()
+    def __iter__(self) -> Iterator[GridCell]:
+        return self._walk_cells()
 
     def __repr__(self):
-        return repr(self._grid[::-1])
+        return repr(self.cell_data[::-1])
+
+    def _walk_cells(self):
+        for i_row in range(len(self.cell_data)):
+            for i_col in range(len(self.cell_data[0])):
+                if self.cell_data[i_row, i_col] != -1:
+                    yield GridCell(self, slice(i_row, i_row+1), slice(i_col, i_col+1))
 
 
 class Geometry:
