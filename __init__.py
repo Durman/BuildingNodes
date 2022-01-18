@@ -1063,14 +1063,23 @@ class JoinFacadesNode(BaseNode, Node):
             mode = inputs.match_mode(base)
             iter_funcs = {'NONE': iter, 'REPEAT': lambda a: chain(a, repeat(a[-1], 1000)), 'CYCLE': cycle}
             direction = inputs.direction(base)
+            is_empty = {f: False for f in fac_funcs}
 
             for fac_func in iter_funcs[mode](fac_funcs if direction == 'VERTICAL' else fac_funcs[::-1]):
                 cur_len = facade.floors_stack and facade.floors_stack[0].panels_stack.width or 0
                 cur_size = Vector((0, facade.floors_stack.width)) if direction == 'VERTICAL' else Vector((cur_len, 0))
+
+                # facade always returns at list one floor even if the height of a base facade is 0
+                if direction == 'VERTICAL' and isclose(base.request_size.y - cur_size.y, 0, abs_tol=0.001):
+                    break
                 with base.size_context(base.request_size - cur_size):
                     sub_f: Facade = fac_func(base)
+
+                # break if all facades are empty
                 if not sub_f.floors_stack:
-                    break
+                    is_empty[fac_func] = True
+                    if all(is_empty.values()):
+                        break
                 try:
                     if direction == 'VERTICAL':
                         facade.join_along_y(sub_f)
