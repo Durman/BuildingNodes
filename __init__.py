@@ -907,11 +907,12 @@ class FloorNode(BaseNode, Node):
     bl_label = "Floor"
     category = Categories.FLOOR
     settings_viewer = DefaultNodeSettings
-    Inputs = namedtuple('Inputs', ['height', 'length', 'scalable', 'left', 'fill', 'right'])
+    Inputs = namedtuple('Inputs', ['height', 'length', 'scalable', 'is_ground', 'left', 'fill', 'right'])
     input_template = Inputs(
         SocketTemplate(FloatSocket, 'Height', False, 'DIAMOND_DOT'),
         SocketTemplate(FloatSocket, 'Length', False, 'DIAMOND_DOT'),
         SocketTemplate(BoolSocket, 'Scalable', False, 'DIAMOND_DOT', True),
+        SocketTemplate(BoolSocket, 'Is ground', False, 'DIAMOND_DOT', True),
         SocketTemplate(PanelSocket, 'Left'),
         SocketTemplate(PanelSocket, 'Fill'),
         SocketTemplate(PanelSocket, 'Right'),
@@ -927,6 +928,7 @@ class FloorNode(BaseNode, Node):
         def floor_gen(base: BaseFacade):
             floor = base.get_floor(base.request_size.x if (l := inputs.length(base)) <= 0 else l)
             floor.is_scalable = inputs.scalable(base)
+            floor.is_ground = inputs.is_ground(base)
 
             if base.read_props:
                 return [floor]
@@ -1109,7 +1111,7 @@ class FacadeNode(BaseNode, Node):
     )
     Outputs = namedtuple('Outputs', ['facade'])
     output_template = Outputs(SocketTemplate(FacadeSocket))
-    floor_props = ['scalable']
+    floor_props = ['scalable', 'is_ground']
 
     @staticmethod
     def execute(inputs: Inputs, params):
@@ -1135,7 +1137,10 @@ class FacadeNode(BaseNode, Node):
             with base.size_context(request_size):
                 facade = Facade(request_size.y)
                 if first_floor := get_floors(inputs.first, count()):
-                    facade.join_along_y(first_floor, throw_error=False)
+                    if first_floor.floors_stack:
+                        first = first_floor.floors_stack[0]
+                        if not first.is_ground or (first.is_ground and isclose(base.level, 0, abs_tol=0.001)):
+                            facade.join_along_y(first_floor, throw_error=False)
                 if last_floor := get_floors(inputs.last, count()):
                     for floor in last_floor.floors_stack:
                         floor.is_last = True
@@ -2055,6 +2060,7 @@ class Floor(Shape):
         # user attributes
         self.height = None
         self.is_scalable = True
+        self.is_ground = True
 
         # util props
         self.is_last = False
@@ -2064,6 +2070,7 @@ class Floor(Shape):
         floor.z_scale = self.z_scale
         floor.height = self.height
         floor.is_scalable = self.is_scalable
+        floor.is_ground = self.is_ground
         floor.is_last = self.is_last
         if copy_panels:
             floor.panels_stack = self.panels_stack.copy()
@@ -2434,13 +2441,14 @@ class Facade:
 
 
 class BaseFacade:
-    def __init__(self, index, size: Vector, mat_index: int):
+    def __init__(self, index, size: Vector, mat_index: int, level: float):
         self.index = index
         self.cur_floor: Floor = None
         self.cur_floor_ind = 0  # it's not always the last index in the floors stack
         self.cur_panel_ind = None  # it's not always the last index in the panels stack
         self.read_props = False
         self.size: Vector = size
+        self.level = level
 
         self.depth: set[Literal['floor_index']] = set()
 
@@ -2490,6 +2498,7 @@ class Building:
     def facades(self) -> Iterable[tuple[BaseFacade, 'CentredMeshGrid']]:
         wall_lay = self._base_bm.faces.layers.int.get("Is wall") or self._base_bm.faces.layers.int.new("Is wall")
         crease_lay = self._base_bm.edges.layers.crease.active
+        min_build_v, _ = Geometry.get_bounding_verts([v.co for v in self._base_bm.verts])
 
         visited = set()
         fac_ind = count()
@@ -2501,7 +2510,9 @@ class Building:
             if is_valid:
 
                 facade_grid = Geometry.connected_coplanar_faces(face, crease_lay)
-                facade = BaseFacade(next(fac_ind), facade_grid.size, face.material_index)
+                first_cell = next(iter(facade_grid))
+                min_facade_v, _ = Geometry.get_bounding_verts([v.co for v in self._base_bm.faces[first_cell.face_indexes[0]].verts])
+                facade = BaseFacade(next(fac_ind), facade_grid.size, face.material_index, min_facade_v.z - min_build_v.z)
                 left_ind, right_ind = facade_grid.corner_cells()
                 left_loop, _ = Geometry.get_bounding_loops(self._base_bm.faces[left_ind])
                 facade.left_wall_angle = left_loop.link_loop_prev.edge.calc_face_angle(3.14)
