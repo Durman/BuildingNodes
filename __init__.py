@@ -2064,6 +2064,10 @@ class Floor(Shape):
     def stack_size(self):
         return self.height * self.z_scale
 
+    @property
+    def is_ledge(self):
+        return isclose(self.panels_stack[0].size.y, 0, abs_tol=0.001) if self.panels_stack else False
+
     def scale_along_stack(self, factor: float):
         self.z_scale *= factor
 
@@ -2078,8 +2082,20 @@ class Floor(Shape):
         width = sum(p.stack_size for p in panels)
         scalable_width = sum(p.stack_size for p in panels if p.is_scalable)
         panels_range = cell.x_range
+
         if panels and panels[-1] == self.panels_stack[-1]:
-            panels_range = cell.x_range - (build.cur_facade.size.x - self.panels_stack.width)
+            """
+              +-------+-----------+ - - - +
+              │+---------+        │       │
+              │+---------+        │       │
+              +-------+-----------+ - - - +
+               ←  panels →
+                      ←    cell   →←empty →
+              ←            facade         →
+            """
+            if cell.x_range.stop > self.panels_stack.width:
+                panels_range -= cell.x_range.stop - self.panels_stack.width
+
         xy_factor = (panels_range.length - (width - scalable_width)) / scalable_width
         for panel in panels:
             p_xy_factor = xy_factor if panel.is_scalable else 1
@@ -2173,8 +2189,8 @@ class ShapesStack(Generic[ShapeType]):
         +-------+------+------  in this case the panel should not be added
         │ *     │ *    │
         """
-        # stack always should has at list one item
-        if not self._shapes:
+        # stack always should has at list one non flat item
+        if not any(not isclose(s.stack_size, 0, abs_tol=0.001) for s in self._shapes):
             return True
         # shape with 0 size always can be added
         if size == 0:
@@ -2296,6 +2312,17 @@ class Facade:
     def __init__(self, height: float):
         self.floors_stack: ShapesStack[Floor] = ShapesStack(height)
 
+    @property
+    def last_floors(self) -> list[Floor]:
+        last_fs = []
+        for floor in reversed(self.floors_stack):
+            if floor.is_last:
+                last_fs.append(floor.copy(self))
+            else:
+                break
+        last_fs.reverse()
+        return last_fs
+
     def join_along_x(self, facade: 'Facade', length):
         is_floor_full = False
         for i, sub_floor in enumerate(facade.floors_stack):
@@ -2358,8 +2385,10 @@ class Facade:
 
             # fix range in case if facade does not cover ful height
             current_range = cell.y_range
-            if floors[-1] == self.floors_stack[-1]:
-                current_range -= build.cur_facade.size.y - self.floors_stack.width
+            is_top = floors[-1] == self.floors_stack[-1]
+            if is_top:
+                if cell.y_range.stop > self.floors_stack.width:
+                    current_range -= cell.y_range.stop - self.floors_stack.width
 
             height = sum(f.stack_size for f in floors)
             scalable_height = sum(f.stack_size for f in floors if f.is_scalable)
@@ -2367,22 +2396,14 @@ class Facade:
 
             # replace top floors if necessary
             fixed_floors = None
-            is_top = floors[-1] == self.floors_stack[-1]
             if cell.is_top and not is_top:
-                last_fs = []
-                for floor in reversed(self.floors_stack):
-                    if floor.is_last:
-                        last_fs.append(floor.copy(self))
-                    else:
-                        break
-                last_fs.reverse()
+                last_fs = self.last_floors
                 if last_fs:
                     fixed_floors: ShapesStack[floors] = ShapesStack(current_range.length)
                     fixed_floors.extend([f.copy(build.cur_facade) for f in floors])
-                    # for floor in fixed_floors:
-                    #     floor.is_scalable = False
+                    fixed_floors.fit_scale()
                     last_fs_height = sum(f.stack_size for f in last_fs)
-                    fixed_floors.replace(last_fs, DistSlice(current_range.stop - last_fs_height, current_range.stop))
+                    fixed_floors.replace(last_fs, DistSlice(current_range.stop - current_range.start - last_fs_height, current_range.stop - current_range.start))
                     fixed_floors.fit_scale()
 
             face = build._base_bm.faces[cell.face_indexes[0]]
@@ -2602,6 +2623,7 @@ class GridCell:
         joined_cell = None
         floors_in_range = None
         nothing_to_join = False
+        last_normal_floor = next(f for f in reversed(floors) if not f.is_ledge)
         for _ in range(1000):
             try:
                 if joined_cell is None:
@@ -2624,7 +2646,7 @@ class GridCell:
                 continue
 
             # check if there is unused top rows
-            if not nothing_to_join and floors[-1] == floors_in_range[-1]:
+            if not nothing_to_join and floors_in_range[-1] == last_normal_floor:
                 continue
 
             break
