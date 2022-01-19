@@ -3067,6 +3067,16 @@ def update_active_object(scene):
             obj_props.apply_style()
 
 
+@persistent
+def update_file(scene):
+    print('UPDATE FILE')
+    for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
+        try:
+            tree.update_sockets()
+        except Exception:
+            traceback.print_exc()
+
+
 def get_node_categories():
     class Base:
         @classmethod
@@ -3093,15 +3103,20 @@ def register():
     bpy.app.handlers.load_post.append(transfer_data_menu)  # this is hack to store function somewhere
     bpy.types.VIEW3D_MT_make_links.append(transfer_data_menu)
     if __name__ == "__main__":
-        for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
-            try:
-                tree.update_sockets()  # todo should be used on file loading
-            except Exception:
-                traceback.print_exc()
+        update_file(None)
+    else:
+        bpy.app.handlers.load_post.append(update_file)
     print("Building Nodes: initialized")
 
 
 def unregister():
+    try:
+        fun_ind = [f.__name__ for f in bpy.app.handlers.load_post].index(update_file.__name__)
+        fun = bpy.app.handlers.load_post[fun_ind]
+    except ValueError:
+        pass
+    else:
+        bpy.app.handlers.load_post.remove(fun)
     try:
         fun_ind = [f.__name__ for f in bpy.app.handlers.load_post].index(update_tree_timer.__name__)
         fun = bpy.app.handlers.load_post[fun_ind]
