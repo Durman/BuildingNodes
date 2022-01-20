@@ -1149,7 +1149,7 @@ class FacadeNode(BaseNode, Node):
                 if not facade.floors_stack.is_full:
                     fill_count = count()
                     for i in range(1000):
-                        if (fill_floor := get_floors(inputs.fill, fill_count)) and not fill_floor.floors_stack:
+                        if not (fill_floor := get_floors(inputs.fill, fill_count)) or not fill_floor.floors_stack:
                             break
                         if any(isclose(floor.height, 0, abs_tol=0.001) for floor in fill_floor.floors_stack):
                             raise SizeError(f"The height of some panel is too small")
@@ -3069,7 +3069,6 @@ def update_active_object(scene):
 
 @persistent
 def update_file(scene):
-    print('UPDATE FILE')
     for tree in (t for t in bpy.data.node_groups if t.bl_idname == BuildingStyleTree.bl_idname):
         try:
             tree.update_sockets()
