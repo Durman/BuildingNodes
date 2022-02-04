@@ -37,7 +37,7 @@ from nodeitems_utils import NodeCategory, NodeItem
 bl_info = {
     "name": "Building Nodes",
     "author": "Soluyanov Sergey",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (3, 0, 0),
     "location": "Property panel -> Building nodes panel and Building style tree editor",
     "description": "Tool for procedural building modeling",
