@@ -1437,30 +1437,29 @@ class GeometryTreeInterface:
     VERSION = "0.11"
     VERSION_KEY = 'bn_version'
 
-    def __init__(self, obj, tree):
-        self._obj = obj
-        self._tree = tree
+    def __init__(self, mod):
+        self._mod = mod
 
         # bad tree
-        if self.VERSION_KEY not in tree:
-            if len(tree.nodes) > 2:
-                raise ValueError(f'Given tree={tree} was created by user - changes are forbidden')
+        if self.VERSION_KEY not in mod.node_group:
+            if len(mod.node_group.nodes) > 2:
+                raise ValueError(f'Given tree={mod.node_group} was created by user - changes are forbidden')
             else:
-                self._arrange_tree(tree, obj)
-                tree[self.VERSION_KEY] = self.VERSION
+                self._arrange_tree(mod.node_group, mod.id_data)
+                mod.node_group[self.VERSION_KEY] = self.VERSION
                 self.update_modifier_interface()
 
         # old version
-        elif tree[self.VERSION_KEY] != self.VERSION:
-            self._arrange_tree(tree, obj)
-            tree[self.VERSION_KEY] = self.VERSION
+        elif mod.node_group[self.VERSION_KEY] != self.VERSION:
+            self._arrange_tree(mod.node_group, mod.id_data)
+            mod.node_group[self.VERSION_KEY] = self.VERSION
             self.update_modifier_interface()
 
     def set_points(self, obj: bpy.types.Object):
-        self._obj.modifiers['BuildingStyle'][self._tree.inputs['Object'].identifier] = obj
+        self._mod[self._mod.node_group.inputs['Object'].identifier] = obj
 
     def set_instances(self, col: bpy.types.Collection):
-        self._obj.modifiers['BuildingStyle'][self._tree.inputs['Collection'].identifier] = col
+        self._mod[self._mod.node_group.inputs['Collection'].identifier] = col
 
     @classmethod
     def is_hostage_tree(cls, tree) -> bool:
@@ -1517,14 +1516,14 @@ class GeometryTreeInterface:
         del_n.mode = 'ONLY_FACE'
 
     def update_modifier_interface(self):
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Vector'].identifier}_use_attribute"] = 1
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Vector'].identifier}_attribute_name"] = "Normal"
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Scale'].identifier}_use_attribute"] = 1
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Scale'].identifier}_attribute_name"] = "Scale"
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Selection'].identifier}_use_attribute"] = 1
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Selection'].identifier}_attribute_name"] = "Is wall"
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Instance Index'].identifier}_use_attribute"] = 1
-        self._obj.modifiers['BuildingStyle'][f"{self._tree.inputs['Instance Index'].identifier}_attribute_name"] = "Wall index"
+        self._mod[f"{self._mod.node_group.inputs['Vector'].identifier}_use_attribute"] = 1
+        self._mod[f"{self._mod.node_group.inputs['Vector'].identifier}_attribute_name"] = "Normal"
+        self._mod[f"{self._mod.node_group.inputs['Scale'].identifier}_use_attribute"] = 1
+        self._mod[f"{self._mod.node_group.inputs['Scale'].identifier}_attribute_name"] = "Scale"
+        self._mod[f"{self._mod.node_group.inputs['Selection'].identifier}_use_attribute"] = 1
+        self._mod[f"{self._mod.node_group.inputs['Selection'].identifier}_attribute_name"] = "Is wall"
+        self._mod[f"{self._mod.node_group.inputs['Instance Index'].identifier}_use_attribute"] = 1
+        self._mod[f"{self._mod.node_group.inputs['Instance Index'].identifier}_attribute_name"] = "Wall index"
 
 
 class ObjectProperties(PropertyGroup):
@@ -1605,11 +1604,11 @@ class ObjectProperties(PropertyGroup):
             redundant_tree = modifier.node_group
             modifier.node_group = self._get_hostage_tree()
             bpy.data.node_groups.remove(redundant_tree)
-            interface = GeometryTreeInterface(obj, modifier.node_group)
+            interface = GeometryTreeInterface(modifier)
             interface.update_modifier_interface()
             return interface
         else:
-            return GeometryTreeInterface(obj, modifier.node_group)
+            return GeometryTreeInterface(modifier)
 
     def _get_hostage_tree(self):
         for tree in bpy.data.node_groups:
