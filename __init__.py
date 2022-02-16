@@ -13,7 +13,7 @@ from cProfile import Profile
 from collections import namedtuple, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from functools import wraps
+from functools import wraps, cmp_to_key
 from graphlib import TopologicalSorter
 from itertools import count, chain, cycle, repeat, accumulate, dropwhile
 from math import isclose, inf
@@ -214,7 +214,8 @@ class BuildingStyleTree(NodeTree):
                         pass  # Already was linked
 
         # let panels know their indexes
-        obj_index = {obj: i for i, obj in enumerate(sorted(self.inst_col.objects, key=lambda o: o.name))}
+        obj_index = {obj: i for i, obj
+                     in enumerate(sorted(self.inst_col.objects, key=lambda o: cmp_to_key(bl_sort_str)(o.name)))}
         for node in self.nodes:
             if node.bl_idname == PanelNode.bl_idname and node.inputs[0].value:
                 node.panel_index = obj_index[node.inputs[0].value]
@@ -3010,6 +3011,33 @@ class Geometry:
 
 class SizeError(Exception):
     """When an element is to small to perform operation"""
+
+
+def bl_sort_str(str1: str, str2: str) -> int:
+    """BLender sorts objects names differently compare to the sorted Python function
+    https://developer.blender.org/diffusion/B/browse/master/source/blender/blenlib/intern/string.c;5f59bf00444bf310d0ad0dd20039839912af5122$882
+
+    >>> sorted(['Obj.2', 'Obj 3', 'Obj.1', 'Obj 4', 'Obj', 'obj'], key=cmp_to_key(bl_sort_str))
+    ['Obj', 'Obj.1', 'Obj.2', 'Obj 3', 'Obj 4', 'obj']
+    """
+    for c1, c2 in zip(str1, str2):
+        if c1 == c2:
+            continue
+        elif c1 == '.':
+            return -1
+        elif c2 == '.':
+            return 1
+        elif c1 < c2:
+            return -1
+        elif c1 > c2:
+            return 1
+
+    if len(str1) > len(str2):
+        return 1
+    elif len(str1) < len(str2):
+        return -1
+    else:
+        return 0
 
 
 def transfer_data_menu(self, context):
