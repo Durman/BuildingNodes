@@ -820,7 +820,9 @@ class PanelRandomizeNode(BaseNode, Node):
                 stream = random.Random(int(inputs.seed(facade)) + facade.index)
                 random_streams[facade.cur_floor] = stream
             panels = [p for inp in inputs[1: -1] if inp and (p := inp(facade)) is not None]
-            return stream.choices(panels, weights=[p.probability for p in panels])[0]
+            weights = [max(p.probability, 0) for p in panels]
+            if sum(weights) > 0:
+                return stream.choices(panels, weights=weights)[0]
         return randomize_panels
 
 
