@@ -3073,11 +3073,11 @@ def update_active_object(scene):
 
     # change active object event, update tree property of Building tree editors
     try:  # todo also changes of the tree editor type should tracked
-        if (prev_obj := scene['active_obj']) != obj:  # todo handle removing objects
+        if (prev_obj := scene['active_obj']) != obj:
             scene['active_obj'] = obj
-            if cur_tree := obj.building_props.building_style:
+            if obj and (cur_tree := obj.building_props.building_style):
                 cur_tree.show_in_areas(True)
-            elif prev_tree := prev_obj.building_props.building_style:
+            elif prev_obj and (prev_tree := prev_obj.building_props.building_style):
                 prev_tree.show_in_areas(False)
     except KeyError:
         scene['active_obj'] = obj
