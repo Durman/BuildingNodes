@@ -3134,7 +3134,7 @@ def register():
         update_file(None)
     else:
         bpy.app.handlers.load_post.append(update_file)
-    print("Building Nodes: initialized")
+    print(f"Building Nodes add-on v{'.'.join(str(i) for i in bl_info['version'])}: initialized")
 
 
 def unregister():
