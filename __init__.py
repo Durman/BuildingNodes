@@ -200,7 +200,7 @@ class BuildingStyleTree(NodeTree):
 
     def store_instances(self) -> bpy.types.Collection:
         if self.inst_col is None:
-            self.inst_col = bpy.data.collections.new('Panel instances')
+            self.inst_col = bpy.data.collections.new("Panel instances - DON'T USE")
 
         for obj in self.inst_col.all_objects:
             self.inst_col.objects.unlink(obj)
