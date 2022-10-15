@@ -1606,7 +1606,8 @@ class ObjectProperties(PropertyGroup):
             modifier = obj.modifiers.new("BuildingStyle", 'NODES')
             redundant_tree = modifier.node_group
             modifier.node_group = self._get_hostage_tree()
-            bpy.data.node_groups.remove(redundant_tree)
+            if redundant_tree:  # is None in 3.3
+                bpy.data.node_groups.remove(redundant_tree)
             interface = GeometryTreeInterface(modifier)
             interface.update_modifier_interface()
             return interface
