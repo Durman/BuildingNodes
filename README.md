@@ -22,12 +22,12 @@ base mesh the add-on will create a building. Base mesh and building style can
 be edited any moment and changes will be applied at once.
 
 ## Features
-| ![figure](docs/images/Apply_style.gif) |
+| ![figure](https://github.com/Durman/BuildingNodesDocs/blob/main/docs/images/Apply_style.gif) |
 |:---:|
 | Once building style was created it can be applied to as many objects as you wish. |
-| ![figure](docs/images/Using_nodes.gif)|
+| ![figure](https://github.com/Durman/BuildingNodesDocs/blob/main/docs/images/Using_nodes.gif)|
 | Using nodes for creating building styles. |
-| ![figure](docs/images/Edit_facade.gif)|
+| ![figure](https://github.com/Durman/BuildingNodesDocs/blob/main/docs/images/Edit_facade.gif)|
 | Editing buildings in real time. |
 
 **Advantages:**
