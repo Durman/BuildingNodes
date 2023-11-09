@@ -37,7 +37,7 @@ from nodeitems_utils import NodeCategory, NodeItem
 bl_info = {
     "name": "Building Nodes",
     "author": "Soluyanov Sergey",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (3, 0, 0),
     "location": "Property panel -> Building nodes panel and Building style tree editor",
     "description": "Tool for procedural building modeling",
@@ -1484,6 +1484,17 @@ class GeometryTreeInterface:
         scale_n = tree.nodes.new('ShaderNodeVectorMath')  # todo this node can be removed
         rotate_n1 = tree.nodes.new('FunctionNodeAlignEulerToVector')
         rotate_n2 = tree.nodes.new('FunctionNodeAlignEulerToVector')
+
+        # add tress sockets - since Blender 3.5 it should be done manually
+        # https://projects.blender.org/blender/blender/issues/105231
+        tree.inputs.new('NodeSocketGeometry', 'Geometry')
+        tree.inputs.new('NodeSocketVector', 'Vector')
+        tree.inputs.new('NodeSocketVectorXYZ', 'Scale')
+        tree.inputs.new('NodeSocketBool', 'Selection')
+        tree.inputs.new('NodeSocketInt', 'Instance Index')
+        tree.inputs.new('NodeSocketObject', 'Object')
+        tree.inputs.new('NodeSocketCollection', 'Collection')
+        tree.outputs.new('NodeSocketGeometry', 'Geometry')
 
         # add links
         tree.links.new(join_n.inputs[0], del_n.outputs[0])
