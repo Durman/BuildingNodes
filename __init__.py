@@ -1459,17 +1459,17 @@ class GeometryTreeInterface:
             self.update_modifier_interface()
 
     def set_points(self, obj: bpy.types.Object):
-        self._mod[self._mod.node_group.inputs['Object'].identifier] = obj
+        self._mod[self._tree_inputs(self._mod.node_group)['Object'].identifier] = obj
 
     def set_instances(self, col: bpy.types.Collection):
-        self._mod[self._mod.node_group.inputs['Collection'].identifier] = col
+        self._mod[self._tree_inputs(self._mod.node_group)['Collection'].identifier] = col
 
     @classmethod
     def is_hostage_tree(cls, tree) -> bool:
         return cls.VERSION_KEY in tree
 
-    @staticmethod
-    def _arrange_tree(tree, obj):
+    @classmethod
+    def _arrange_tree(cls, tree, obj):
         tree.nodes.clear()
 
         # add nodes
@@ -1487,14 +1487,15 @@ class GeometryTreeInterface:
 
         # add tress sockets - since Blender 3.5 it should be done manually
         # https://projects.blender.org/blender/blender/issues/105231
-        tree.inputs.new('NodeSocketGeometry', 'Geometry')
-        tree.inputs.new('NodeSocketVector', 'Vector')
-        tree.inputs.new('NodeSocketVectorXYZ', 'Scale')
-        tree.inputs.new('NodeSocketBool', 'Selection')
-        tree.inputs.new('NodeSocketInt', 'Instance Index')
-        tree.inputs.new('NodeSocketObject', 'Object')
-        tree.inputs.new('NodeSocketCollection', 'Collection')
-        tree.outputs.new('NodeSocketGeometry', 'Geometry')
+        vec_type = 'NodeSocketVector' if bpy.app.version >= (4, 0) else 'NodeSocketVectorXYZ'
+        cls._new_tree_socket(tree, 'NodeSocketGeometry', 'Geometry', in_out='INPUT')
+        cls._new_tree_socket(tree, 'NodeSocketVector', 'Vector', in_out='INPUT')
+        cls._new_tree_socket(tree, vec_type, 'Scale', in_out='INPUT')
+        cls._new_tree_socket(tree, 'NodeSocketBool', 'Selection', in_out='INPUT')
+        cls._new_tree_socket(tree, 'NodeSocketInt', 'Instance Index', in_out='INPUT')
+        cls._new_tree_socket(tree, 'NodeSocketObject', 'Object', in_out='INPUT')
+        cls._new_tree_socket(tree, 'NodeSocketCollection', 'Collection', in_out='INPUT')
+        cls._new_tree_socket(tree, 'NodeSocketGeometry', 'Geometry', in_out='OUTPUT')
 
         # add links
         tree.links.new(join_n.inputs[0], del_n.outputs[0])
@@ -1530,14 +1531,27 @@ class GeometryTreeInterface:
         del_n.mode = 'ONLY_FACE'
 
     def update_modifier_interface(self):
-        self._mod[f"{self._mod.node_group.inputs['Vector'].identifier}_use_attribute"] = 1
-        self._mod[f"{self._mod.node_group.inputs['Vector'].identifier}_attribute_name"] = "Normal"
-        self._mod[f"{self._mod.node_group.inputs['Scale'].identifier}_use_attribute"] = 1
-        self._mod[f"{self._mod.node_group.inputs['Scale'].identifier}_attribute_name"] = "Scale"
-        self._mod[f"{self._mod.node_group.inputs['Selection'].identifier}_use_attribute"] = 1
-        self._mod[f"{self._mod.node_group.inputs['Selection'].identifier}_attribute_name"] = "Is wall"
-        self._mod[f"{self._mod.node_group.inputs['Instance Index'].identifier}_use_attribute"] = 1
-        self._mod[f"{self._mod.node_group.inputs['Instance Index'].identifier}_attribute_name"] = "Wall index"
+        inputs = self._tree_inputs(self._mod.node_group)
+        self._mod[f"{inputs['Vector'].identifier}_use_attribute"] = 1
+        self._mod[f"{inputs['Vector'].identifier}_attribute_name"] = "Normal"
+        self._mod[f"{inputs['Scale'].identifier}_use_attribute"] = 1
+        self._mod[f"{inputs['Scale'].identifier}_attribute_name"] = "Scale"
+        self._mod[f"{inputs['Selection'].identifier}_use_attribute"] = 1
+        self._mod[f"{inputs['Selection'].identifier}_attribute_name"] = "Is wall"
+        self._mod[f"{inputs['Instance Index'].identifier}_use_attribute"] = 1
+        self._mod[f"{inputs['Instance Index'].identifier}_attribute_name"] = "Wall index"
+
+    @staticmethod
+    def _new_tree_socket(tree, bl_idname, name, in_out='INPUT'):
+        if bpy.app.version >= (4, 0):
+            tree.interface.new_socket(name, in_out=in_out, socket_type=bl_idname)
+        else:
+            socks = tree.inputs if in_out == 'INPUT' else tree.outputs
+            return socks.new(bl_idname, name)
+
+    @staticmethod
+    def _tree_inputs(tree):  # not exactly inputs for Blender 4+
+        return tree.interface.items_tree if bpy.app.version >= (4, 0) else tree.inputs
 
 
 class ObjectProperties(PropertyGroup):
@@ -2528,7 +2542,12 @@ class Building:
     @property
     def facades(self) -> Iterable[tuple[BaseFacade, 'CentredMeshGrid']]:
         wall_lay = self._base_bm.faces.layers.int.get("Is wall") or self._base_bm.faces.layers.int.new("Is wall")
-        crease_lay = self._base_bm.edges.layers.crease.active
+        if bpy.app.version >= (4, 0):  # https://projects.blender.org/blender/blender/pulls/108089
+            crease_lay = self._base_bm.edges.layers.float.get('crease_edge')
+            if crease_lay is None:  # when there is no single edge with a crease
+                crease_lay = self._base_bm.edges.layers.float.new('crease_edge')
+        else:
+            crease_lay = self._base_bm.edges.layers.crease.active
         min_build_v, _ = Geometry.get_bounding_verts([v.co for v in self._base_bm.verts])
 
         visited = set()
