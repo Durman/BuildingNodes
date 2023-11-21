@@ -2,9 +2,9 @@
 
 🏠 Tool for fast procedural building modeling | [Blender 3.0+](https://www.blender.org/) add-on 🏠
 
-[**Documentation**](https://durman.github.io/BuildingNodesDocs/) ([on GitHub](https://github.com/Durman/BuildingNodesDocs))
+[**Download**](https://github.com/Durman/BuildingNodes/releases/latest) the latest release
 
-**Download - press Code button, Download ZIP**
+[**Documentation**](https://durman.github.io/BuildingNodesDocs/) ([on GitHub](https://github.com/Durman/BuildingNodesDocs))
 
 ## Description
 
